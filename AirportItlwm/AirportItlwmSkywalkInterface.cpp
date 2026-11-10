@@ -902,6 +902,80 @@ setSCANCACHE_CLEAR(void *req)
     return kIOReturnSuccess;
 }
 
+/*
+ * Stage 1: native AWDL (role 6) virtual-interface creation.
+ *
+ * This handler is intentionally fail-closed. It never allocates a virtual
+ * interface, never attaches it to the controller, never registers a BSD
+ * interface and never writes data->bsd_name. A BSD name is only meaningful
+ * after a successful registration, so returning it here would be a lie.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+setVIRTUAL_IF_CREATE(struct apple80211_virt_if_create_data *data)
+{
+    if (data == nullptr)
+        return kIOReturnBadArgument;
+
+    XYLog("%s: role=%u mac=%02x:%02x:%02x:%02x:%02x:%02x bsd=\"%.*s\"\n",
+          __FUNCTION__,
+          (unsigned)data->role,
+          data->mac[0], data->mac[1], data->mac[2],
+          data->mac[3], data->mac[4], data->mac[5],
+          (int)sizeof(data->bsd_name), (const char *)data->bsd_name);
+
+    if (data->role != (uint32_t)APPLE80211_VIF_AWDL) {
+        XYLog("%s: role %u is not handled here; only role %u (AWDL) is "
+              "being investigated\n",
+              __FUNCTION__, (unsigned)data->role,
+              (unsigned)APPLE80211_VIF_AWDL);
+        return kIOReturnUnsupported;
+    }
+
+#if !ITLWM_AWDL_EXPERIMENTAL
+    XYLog("%s: AWDL role 6 rejected: built with ITLWM_AWDL_EXPERIMENTAL=0\n",
+          __FUNCTION__);
+    return kIOReturnUnsupported;
+#else
+    if (!itlwmAwdlExperimentalEnabled()) {
+        XYLog("%s: AWDL role 6 rejected: boot with itlwm_awdl=1 to arm the "
+              "experimental path\n", __FUNCTION__);
+        return kIOReturnUnsupported;
+    }
+
+    /*
+     * Stage-1 ABI gate, validated against this machine's 25G332 (Darwin
+     * 25.6.0) BootKernelExtensions.kc:
+     *
+     *   __ZTV19IO80211AWDLProtocol            0x11d8  (568 slots + null)
+     *   __ZTV23IO80211VirtualInterface         0xfe0   (505 slots + null)
+     *   AWDL pure region                       vtable+0xFC8 .. vtable+0x11B8
+     *   IO80211VirtualInterface::setMacAddress vtable+0xF40, pure
+     *
+     * All 64 pure entries resolve to the kernel's shared pure-virtual stub
+     * (0xffffff8000bb77f0 in this collection, 2,423 references across
+     * __DATA), so IO80211AWDLProtocol is abstract. A concrete role-6
+     * interface must override setMacAddress plus all 63 AWDL slots with the
+     * exact signatures and reproduce the 505-slot base chain.
+     *
+     * This tree cannot express that layout:
+     *   - include/Airport/IO80211VirtualInterface.h declares
+     *     `IO80211VirtualInterface : IOService` with 37 virtuals, while the
+     *     real class is an IO80211SkywalkInterface subclass with a 0xfe0
+     *     vtable;
+     *   - there is no IO80211AWDLProtocol declaration at all.
+     *
+     * Registering a virtual interface whose vtable is shifted would corrupt
+     * kernel dispatch, so Stage 1 stops before allocation/attach/register.
+     * It does not fabricate an awdl0 interface.
+     */
+    XYLog("%s: AWDL role 6 blocked: IO80211AWDLProtocol (25G332) is "
+          "abstract and its 0x11d8 vtable cannot be reconstructed from the "
+          "headers in this tree; no virtual interface was created\n",
+          __FUNCTION__);
+    return kIOReturnUnsupported;
+#endif
+}
+
 IOReturn AirportItlwmSkywalkInterface::
 setDEAUTH(struct apple80211_deauth_data *da)
 {

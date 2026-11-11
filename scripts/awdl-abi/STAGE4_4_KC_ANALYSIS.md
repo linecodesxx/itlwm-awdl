@@ -1890,20 +1890,20 @@ QueueSet array at `LogicalLink+0x10`
 (count `LogicalLink+0x28`). For each QueueSet:
 
 1. Calls **QueueSet virtual `+0x118`** with
-   argument `nullptr`: the vtable target has
-   not yet been mapped on this KC and MUST NOT
-   be named by inference.
+   argument `nullptr` (resolved by the next local
+   vtable scan as **`IOSkywalkQueueSet::setEnable(false)`**).
+   This disables each queue but is not event-source removal.
 2. Calls `IOSkywalkQueueSet::setLogicalLink(nullptr)`
    directly.
 3. Calls QueueSet virtual `+0x28` (`release()`),
    clears the pointer slot, then frees the array
    and tails to superclass `free()`.
 
-A particularly important next question is whether
-the unknown `QueueSet+0x118` is a disable/
-shutdown method or another operation, and
-whether it is sufficient to prevent WorkLoop-
-driven and external TX callback entry.
+The virtual call is now verified as **QueueSet::setEnable(false)**.
+The outstanding question is whether the higher-level
+owner later removes the disabled queues from the
+workloop, rules out external TX callbacks, and drains
+their borrowed `refCon` users.
 
 There are **no directly identified calls**
 to `IOWorkLoop::removeEventSource()` in
@@ -1925,8 +1925,8 @@ queue; `QueueSet::finalize()` finalizes
 selected queue categories; `QueueSet::free()`
 releases held references. `LogicalLink::setInterface(nullptr)`
 unregisters queues from their pools, while
-`LogicalLink::free()` performs an *as-yet
-unmapped* QueueSet virtual before its release.
+`LogicalLink::free()` calls the now-confirmed
+`QueueSet::setEnable(false)` before its release.
 
 **Unproven:** that the higher-level owner invokes
 these lifecycle stages in an appropriate order,
@@ -1936,10 +1936,142 @@ can subsequently enter, and that all already-
 executing calls using `TxCallbackContext` exit
 before its memory is freed.
 
-Next inspect `IOSkywalkQueueSet` vptr
-`+0x118/+0x128` and queue
-`+0x1b8/+0x1c0/+0x1e8/+0x218`,
-and `IOEventSource::free()` to assess
-inherited detach behavior. Keep
+The subsequent local scan resolved `IOSkywalkQueueSet`
+`+0x118/+0x128` and queue `+0x1b8/+0x1c0/+0x1e8/+0x218`;
+`IOEventSource::free()` has also been inspected.
+See section 25 for the confirmed names and outcome. Keep
 `ITLWM_AWDL_REGISTRATION_ENABLED=0`
 and `ITLWM_AWDL_DATAPATH_LIVE=0`.
+
+
+
+## 25. QueueSet disable mapping and no implicit IOEventSource detach (2026-11-11)
+
+**Evidence:** developer-supplied local 25G332 KC vtable mapping
+for `IOSkywalkQueueSet`, `IOSkywalkLogicalLink`,
+`IOSkywalkPacketQueue` and `IOSkywalkTxSubmissionQueue`,
+plus the full local bodies of
+`IOEventSource::{free,setWorkLoop}`. The section
+summarizes the result without reproducing proprietary code.
+
+### 25.1 LogicalLink::free pre-release dispatch is setEnable(false)
+
+The unidentified call from
+`IOSkywalkLogicalLink::free()` at
+`0xffffff8002b11538`, using QueueSet
+object-vptr `+0x118` with `nullptr`, is
+**now exactly identified**:
+
+- `IOSkywalkQueueSet +0x118` is
+  `IOSkywalkQueueSet::setEnable(bool)`,
+  `0xffffff8002b189ce`.
+- `IOSkywalkLogicalLink +0x118` is
+  `IOSkywalkLogicalLink::setEnable(bool)`,
+  `0xffffff8002b11652`.
+
+Thus, `LogicalLink::free` deliberately invokes
+`QueueSet::setEnable(false)` for each retained
+QueueSet **before** calling
+`setLogicalLink(nullptr)` and `release()`.
+This dispatches queue `disable()` as already
+verified in section 24.1. It does **not**
+show queue WorkLoop removal.
+
+`IOSkywalkQueueSet +0x128` also resolves to
+`setQueueSetId(uint64_t)` at
+`0xffffff8002b18b68`; the early self-virtual
+in `QueueSet::initialize` is an ID assignment,
+**not** workloop registration or callback startup.
+
+### 25.2 Queue object virtuals resolve additional lifecycle calls
+
+| Queue vptr offset | Base IOSkywalkPacketQueue | IOSkywalkTxSubmissionQueue |
+|---|---|---|
+| `+0x150` | inherited `IOEventSource::enable()` | `enable()` |
+| `+0x158` | `IOSkywalkPacketQueue::disable()` | `disable()` |
+| `+0x1b8` | `initialize(void*)` | `initialize(void*)` |
+| `+0x1c0` | `finalize()` | `finalize()` |
+| `+0x1e8` | `getPacketBufferPool() const` | inherited getter |
+| `+0x218` | `performCommand(unsigned,void*,unsigned long)` | TX-specific override |
+
+Concrete mapping:
+
+- `IOSkywalkPacketQueue::getPacketBufferPool()`
+  at `0xffffff8002b0df40` is what
+  `LogicalLink::setInterface` calls before
+  `checkInPacketQueue`/`checkOutPacketQueue`.
+- `IOSkywalkTxSubmissionQueue::performCommand`
+  at `0xffffff8002b128b6` is the target of
+  the virtual `+0x218` when the QueueSet
+  initializes this queue subtype, including
+  its earlier `0x50000` invocation. The
+  method's body remains a next target;
+  do not assign it unknown side effects.
+
+### 25.3 IOEventSource::free does NOT remove itself from WorkLoop
+
+`IOEventSource::free()` at
+`0xffffff8000acc2a0`:
+
+1. If its statistics object exists at
+   `eventSource+0x40`, calls
+   `IOStatistics::unregisterEventSource`.
+2. When an internal flag is set, releases
+   a stored Block action at `+0x20`.
+3. Frees the event-source statistics backing
+   storage, nulls `+0x40`, handles metaclass
+   destruction bookkeeping and tail-calls
+   the next superclass free/destructor slot.
+
+**There is no call in this method** to
+`IOWorkLoop::removeEventSource`, `setWorkLoop`,
+or any callback-drain function, nor does it
+explicitly inspect the workloop pointer at `+0x30`.
+It performs resource reclamation, **not
+automatic workloop detachment**.
+
+`IOEventSource::setWorkLoop(IOWorkLoop*)`
+at `0xffffff8000acc390` calls the
+object's `disable()` vptr `+0x158`
+when passed null, and then stores the new
+workloop pointer in `eventSource+0x30`.
+This matches section 19's
+`IOWorkLoop::_maintRequest` remove operation,
+which calls `setWorkLoop(nullptr)`.
+
+### 25.4 Distinct lifecycle stages and safety invariant
+
+```text
+QueueSet::setEnable(false) -> each queue::disable()
+workloop::removeEventSource(queue) -> remove + disable + clear link
+QueueSet::finalize() -> selected queue::finalize()
+QueueSet::free() -> release held queue references
+IOEventSource::free() -> destroy local event-source resources
+```
+
+These are distinct stages; **none on its own
+proves global no-future-entry into TX
+packet submission callbacks**. A workloop may
+still retain a disabled queue until explicitly
+removed, and a driver-held borrowed `refCon`
+may outlive the backend context incorrectly.
+A successful gated detach prevents later
+workloop-list traversal entries but not
+direct calls from outside the workloop.
+There is also no evidence that `IOEventSource::free`
+will act as a last-chance detach if the owner
+forgot to remove it.
+
+**Unresolved before experimental AWDL enablement:**
+
+1. Identify the owner-side queue `addEventSource`/
+   `removeEventSource` sites (or another independently
+   equivalent no-future-entry sequence).
+2. Resolve `LogicalLink::setEnable` and TX
+   `performCommand` bodies to see how they affect
+   direct TX scheduling and queue state.
+3. Prove direct packet-submission callers stop,
+   then drain all borrowed-`refCon` callbacks
+   before `TxCallbackContext` destruction.
+4. Keep both Stage 4 registration/datapath flags
+   disabled and do not modify runtime/EFI.

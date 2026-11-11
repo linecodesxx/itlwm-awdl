@@ -122,6 +122,44 @@ private:
     }
 };
 
+struct TxActionProbe {
+    void *expectedPacket;
+    uint32_t calls;
+    uint32_t returnCount;
+};
+
+static uint32_t probeTxAction(void *opaque, void *const *packets, uint32_t count)
+{
+    TxActionProbe *probe = static_cast<TxActionProbe *>(opaque);
+    probe->calls++;
+    CHECK(count == 1);
+    CHECK(packets[0] == probe->expectedPacket);
+    return probe->returnCount;
+}
+
+static void test_callback_dispatch()
+{
+    int packet = 123;
+    void *packets[] = {&packet};
+    TxActionProbe probe = {&packet, 0, 1};
+    TxAction action = {probeTxAction, &probe};
+
+    CHECK(dispatchTxAction(action, packets, 1) == 1);
+    CHECK(probe.calls == 1);
+
+    probe.returnCount = 2; /* invalid: accepted > supplied */
+    CHECK(dispatchTxAction(action, packets, 1) == 0);
+    CHECK(probe.calls == 2);
+
+    CHECK(dispatchTxAction(action, nullptr, 1) == 0);
+    CHECK(dispatchTxAction(action, packets, 0) == 0);
+    CHECK(probe.calls == 2);
+
+    action.dequeue = nullptr;
+    CHECK(dispatchTxAction(action, packets, 1) == 0);
+    CHECK(probe.calls == 2);
+}
+
 static Config makeConfig()
 {
     Config c;
@@ -389,6 +427,7 @@ static void test_ledger_exactly_once()
 
 int main()
 {
+    test_callback_dispatch();
     test_initial_state();
     test_success_and_teardown();
     test_initialize_twice();

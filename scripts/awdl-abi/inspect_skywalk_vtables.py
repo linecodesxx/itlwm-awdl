@@ -19,6 +19,7 @@ DEFAULT_KC = "/System/Library/KernelCollections/BootKernelExtensions.kc"
 DEFAULT_WTL = os.path.expanduser("~/Desktop/WTLKcAbi")
 CLASSES = (
     "IOSkywalkPacket",
+    "IOSkywalkPacketBuffer",
     "IOSkywalkPacketBufferPool",
     "IOSkywalkPacketQueue",
     "IOSkywalkTxSubmissionQueue",

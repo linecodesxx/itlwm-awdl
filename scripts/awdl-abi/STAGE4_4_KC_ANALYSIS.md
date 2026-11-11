@@ -191,10 +191,39 @@ quiescence or packet return**.
 
 ### 9.5 Still blocked
 
-- Identify `TxCompletionQueue::vptr+0x1c0`, and base disable raw
-  `__ZTV20IOSkywalkPacketQueue+0x168` = object-vptr `+0x158`.
+- **Identified, not behaviorally verified:** `TxCompletionQueue::vptr+0x1c0` is `IOSkywalkTxCompletionQueue::finalize()` and raw `__ZTV20IOSkywalkPacketQueue+0x168` is `IOSkywalkPacketQueue::disable()` at object-vptr `+0x158`. Their names and addresses are confirmed; the `finalize()` body is not yet disassembled here.
 - Inspect `IOSkywalkPacket::{completeWithQueue,disposePacket}` and pool
   `deallocatePacket(s)`, `releaseAllPackets`.
 - Review `initWithPool` and the source-queue/table handoff to distinguish
   capacity, packet-buffer ownership and actual callback quiescence.
 - Real `AWDL` and live datapath remain **disabled**.
+
+
+## 10. Next local symbol mapping and packet-lifetime discovery (2026-11-11)
+
+The developer ran `inspect_skywalk_vtables.py --classes IOSkywalkPacketQueue,IOSkywalkTxCompletionQueue --offsets 0x90,0x158,0x1c0` against the local `25G332` KC and reported:
+
+| Class | vptr offset | Confirmed method | Address |
+|---|---|---|---|
+| `IOSkywalkPacketQueue` | `0x90` | `free()` | `0xffffff8002b0dc8e` |
+| `IOSkywalkPacketQueue` | `0x158` | `disable()` | `0xffffff8002b0de34` |
+| `IOSkywalkPacketQueue` | `0x1c0` | `finalize()` | `0xffffff8002b0ddcc` |
+| `IOSkywalkTxCompletionQueue` | `0x90` | `free()` | `0xffffff8002b17a94` |
+| `IOSkywalkTxCompletionQueue` | `0x158` | `disable()` | `0xffffff8002b17b58` |
+| `IOSkywalkTxCompletionQueue` | `0x1c0` | `finalize()` | `0xffffff8002b17d6e` |
+
+Thus the first virtual call made by the specialized `TxCompletionQueue::free()` at `this->vptr+0x1c0` resolves to **`TxCompletionQueue::finalize()`**. It is a potentially important teardown operation, but its name **does not establish** callback draining, no-future-entry, queue detachment, or packet ownership correctness. Its actual body and callers still need inspection.
+
+The subsequent read-only collector run found 7 symbol entries with 6 nonempty method bodies:
+
+- `IOSkywalkPacketBufferPool::deallocatePacket()` — 27 lines
+- `IOSkywalkPacketBufferPool::deallocatePackets()` — 51 lines
+- `IOSkywalkPacket::completeWithQueue()` — 53 lines
+- `IOSkywalkPacket::disposePacket()` — 29 lines
+- `IOSkywalkPacketBufferPool::releaseAllPackets()` — 27 lines
+- `IOSkywalkPacketBufferPool::releaseAllMemorySegments()` — 19 lines
+
+The seventh entry is a kalloc type-view metadata symbol with zero instructions.
+**Only the console summary, not the contents of `/tmp/awdl-skywalk-packet-lifetime.txt`, has been received.** No conclusions about these methods' internal error handling, resource release ordering or success paths are warranted yet.
+
+**Next:** collect `finalize()` bodies for the base and specialized queues using the read-only collector, and review the developer's local packet-lifetime evidence file. Keep AWDL runtime flags off.

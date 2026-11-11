@@ -30,19 +30,19 @@
 
 `IOSkywalkTxCompletionQueue::enqueuePackets(IOSkywalkPacket*, uint32_t, uint32_t)` at `0xffffff8002b32c6e`:
 
-- Traverses `IOSkywalkPacket::getNextPacket`, clears each `next`, notifies its source queue, invokes packet virtual method at `+0x198`, and conditionally calls `_kern_packet_tx_completion`.
-- Processes individual packets via a virtual method at `[*(this+0x50)]+0x140`. This is **not** the same call sequence as the pointer-array overload; the exact virtual target is not yet identified.
+- Traverses `IOSkywalkPacket::getNextPacket`, clears each `next`, notifies its source queue, invokes `IOSkywalkPacket::completeWithQueue` at vptr offset `+0x198`, and conditionally calls `_kern_packet_tx_completion`.
+- Calls `IOSkywalkPacketBufferPool::deallocatePacket` via `[*(this+0x50)]+0x140` for each packet; this is **not** the same call sequence as the pointer-array overload. The destination corresponds to the packet-pool vtable, supporting `this+0x50` as a pool pointer. Inspect the target body to confirm whether every failure and partial-batch path returns a packet.
 - Calls source-queue notification and stats callbacks. The shown function does not call the named `completePackets` method.
 
 ## 3. TX completion bookkeeping and possible return-to-pool boundary
 
 `IOSkywalkTxCompletionQueue::completePackets(IOSkywalkPacket**, uint32_t)` at `0xffffff8002b17b9e`:
 
-- For each packet, calls a packet virtual at offset `+0x140`, `getSourceQueue`, `notifySrcQueue`, and another packet virtual at `+0x198` with queue and flag arguments.
+- For each packet, calls `IOSkywalkPacket::getDataLength` at vptr offset `+0x140`, `getSourceQueue`, `notifySrcQueue`, and `IOSkywalkPacket::completeWithQueue` at offset `+0x198` with queue and flag arguments.
 - Conditionally calls `_kern_packet_tx_completion` when `this+0xe8` is non-null.
-- **After the per-packet loop**, invokes a virtual method at `[*(this+0x50)]+0x148` with the packet-pointer array and count; then notifies the source and updates stats.
+- **After the per-packet loop**, invokes `IOSkywalkPacketBufferPool::deallocatePackets` at `[*(this+0x50)]+0x148` with the packet-pointer array and count; then notifies the source and updates stats.
 
-This call sequence is direct evidence of a **later batch operation** after per-packet TX completion. It is **not yet proof** that the `+0x148` method frees, returns or recycles every packet: resolve the target's class/vtable and inspect it before wiring `Ownership::acknowledgeReturn`. Likewise identify packet virtual slots `+0x140` and `+0x198`.
+The 2026-11-11 vtable inspection **identifies the batch operation as `deallocatePackets()`**. This is stronger evidence for a real TX return-to-pool path. It is **not yet proof** that the method succeeds for every packet, that failures are handled safely, or that a host-only `Ownership::acknowledgeReturn` can be called at any specific point. Inspect `deallocatePacket(s)` and the caller's error paths before integrating accounting.
 
 ## 4. RX completion: different consumers and ownership boundaries
 
@@ -59,7 +59,7 @@ This call sequence is direct evidence of a **later batch operation** after per-p
 `IOSkywalkRxCompletionQueue::enqueuePackets(IOSkywalkPacket*, uint32_t, uint32_t)` at `0xffffff8002b32810`:
 
 - Traverses an `IOSkywalkPacket` chain and constructs a native `kern_packet_t` linked list with `_kern_packet_set_next`.
-- Invokes packet virtual slots `+0x140`, `+0x198` (with mode/flag 2), and `+0x1e0`; optionally taps BPF.
+- Invokes `IOSkywalkPacket::getDataLength()` at `+0x140`, `completeWithQueue()` at `+0x198` (mode/flag 2), and `disposePacket()` at `+0x1e0`; optionally taps BPF. `disposePacket` does **not** by itself establish native packet return-to-pool semantics.
 - Calls `_kern_netif_queue_rx_enqueue` at `0xffffff80009e7730` with the native list and count. The shown function **does not test** its return register before continuing to statistics and returning zero.
 
 This gives a likely handoff point to networking, **not** an evidenced packet-return acknowledgement or a guarantee about failed enqueue cases.
@@ -69,7 +69,7 @@ This gives a likely handoff point to networking, **not** an evidenced packet-ret
 Each of the three `IOSkywalk{TxSubmission,TxCompletion,RxCompletion}Queue::disable()` wrappers:
 
 1. If workloop pointer at `this+0x30` exists, calls `IOEventSource::closeGate`.
-2. Invokes base `IOSkywalkPacketQueue` virtual slot `+0x168`.
+2. Performs an indirect call at `[&__ZTV20IOSkywalkPacketQueue + 0x168]`, **measured from the raw vtable symbol**, not from the C++ object vptr. The Itanium two-entry header shifts the callable index by 16 bytes: this corresponds to **vptr offset `+0x158` (slot 43)**. The current vptr-based inspection only included `+0x168` (slot 45), which resolves to `IOEventSource::getWorkLoop()` and must **not** be mistaken for the target here. Resolve `+0x158` next.
 3. Reopens the event-source gate with `IOEventSource::openGate` when the workloop pointer exists.
 
 `IOSkywalkPacketQueue::disable` (`0xffffff8002b0de34`) additionally checks `this+0x68` and may call `resetABFS`, then jumps to a further virtual slot `+0x168`.
@@ -89,10 +89,25 @@ must be investigated.
 
 ## 7. Targeted next evidence needed
 
-1. **Resolve vtable slots:** `IOSkywalkPacketBufferPool` virtual offsets `0x140`, `0x148`, and `IOSkywalkPacket` offsets `0x140`, `0x198`, `0x1e0`. A reported symbol name is necessary but not sufficient: inspect the target body and overrides.
+1. **Resolve base disable target:** the raw vtable symbol `__ZTV20IOSkywalkPacketQueue + 0x168` is **object-vptr + 0x158**, not +0x168. Inspect slot 43 explicitly, then examine the target body. The packet and pool vptr slots `0x140`, `0x148`, `0x198`, `0x1e0` have been named from the local KC; now inspect `deallocatePacket(s)`, `completeWithQueue`, and `disposePacket` to verify ownership and failure semantics.
 2. **RX sink internals:** `IOSkywalkRxCompletionQueue::enqueuePacketsForNetworking` and `enqueuePacketsForKPipe` and their failure/return paths.
 3. **Queue destruction:** all relevant `free()`, `IOSkywalkPacketQueue::disable`, `resetABFS`, and workloop/event-source detach behavior.
 4. **Context lifetime:** find the owner-side teardown sequence and demonstrate no callbacks can enter after the last reference to the callback refCon is released.
 5. **Configuration:** verify whether `this+0xac` corresponds to the capacity argument, since array overloads require strictly fewer packets than this field.
 
 With these incomplete, **TX/RX live datapath remains blocked**.
+
+
+## 8. Named virtual methods from local vtable listing (2026-11-11)
+
+| Owner class | vptr offset | KC symbol | Address |
+|---|---:|---|---|
+| `IOSkywalkPacket` | `0x140` | `getDataLength() const` | `0xffffff8002b0b4d0` |
+| `IOSkywalkPacket` | `0x198` | `completeWithQueue(IOSkywalkPacketQueue*, uint, uint)` | `0xffffff8002b0b6fa` |
+| `IOSkywalkPacket` | `0x1e0` | `disposePacket()` | `0xffffff8002b0b854` |
+| `IOSkywalkPacketBufferPool` | `0x140` | `deallocatePacket(IOSkywalkPacket*)` | `0xffffff8002b310de` |
+| `IOSkywalkPacketBufferPool` | `0x148` | `deallocatePackets(IOSkywalkPacket**, uint)` | `0xffffff8002b31128` |
+
+Additional local collection reported 14 symbol matches, including 32 lines of TX submission queue `free()`, 31 lines of TX completion queue `free()`, 32 lines of RX completion queue `free()`, 20 lines of base queue `free()`, 62 lines of pool `free()`, 91 lines of `enqueuePacketsForNetworking()`, 65 lines of `enqueuePacketsForKPipe()`, and 27 lines of `resetABFS()`. The actual **second disassembly file is not yet available for review**, so we cannot assert anything about their control flow or drain behavior.
+
+**Critical ABI offset distinction:** In the `disable()` wrappers the indirect call operand is based on the raw `__ZTV` symbol (`lea ... __ZTV20IOSkywalkPacketQueue`), which includes two 8-byte Itanium metadata entries. The tool's `--offsets` switch instead takes offsets from the C++ **vptr**. Thus raw `__ZTV+0x168` maps to callable vptr `+0x158` (slot 43), **not** the printed `getWorkLoop()` at vptr `+0x168` (slot 45). Query this corrected slot before interpreting the disable target.

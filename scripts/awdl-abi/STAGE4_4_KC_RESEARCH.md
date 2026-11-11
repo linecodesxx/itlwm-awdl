@@ -778,3 +778,64 @@ packetSubmission callers, rather than inferring an
 all-callback drain merely from the generic workloop
 mechanism. All flags remain disabled; no kext or EFI
 changes.
+
+
+
+## 25G332 workloop action identity confirmed (2026-11-11)
+
+The local `IOWorkLoop` vptr `+0x118` was mapped to
+`IOWorkLoop::_maintRequest` at
+`0xffffff8000acaac0`. This is **direct evidence in the
+actual 25G332 KC** that `IOWorkLoop::init()`
+passes `_maintRequest` as its internal command-gate
+action, completing the chain:
+`removeEventSource -> IOCommandGate::runCommand ->
+runAction -> _maintRequest`.
+
+Other newly mapped slots:
+
+- `IOEventSource +0x120` = `checkForWork`;
+  the specialized `IOSkywalkTxSubmissionQueue +0x120`
+  = `IOSkywalkTxSubmissionQueue::checkForWork`.
+- `IOEventSource +0x128/+0x130/+0x138/+0x168`
+  = `setWorkLoop/setNext/getNext/getWorkLoop`,
+  all inherited by the Skywalk TX submission queue.
+- `IOCommandGate +0x1b8` = `init(owner, action)`;
+  `IOSkywalkTxSubmissionQueue +0x1b8` =
+  `initialize(void*)` at `0xffffff8002b11e8e`.
+
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 20 for the full local table, verified call chain and
+the remaining direct-callback lifetime risk.
+
+**Meaning:** a successful workloop removal is serialized
+with `runEventSources/checkForWork` under that same gate.
+**Not proved:** all non-workloop TX producer paths stop,
+or that a future AWDL backend performs this detach
+before freeing the borrowed `refCon`.
+No runtime operation is authorized.
+
+### Next read-only KC evidence (includes cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkTxSubmissionQueue,IOSkywalkPacketQueue \\
+  --methods initialize,enable,disable \\
+  --max-functions 12 --max-lines 380 \\
+  --out /tmp/awdl-skywalk-tx-attach-lifecycle.txt
+
+cat /tmp/awdl-skywalk-tx-attach-lifecycle.txt
+```
+
+The method name filters work without a new collector code
+change. This inspection seeks a queue workloop attach
+path or producer registration. Finding no attach call
+there would not prove no owner code can attach the queue;
+the caller side still requires independent inspection.
+
+**Guardrails:** never publish raw KC disassembly, never
+enable the experimental AWDL registration/datapath, and
+do not install a research kext.

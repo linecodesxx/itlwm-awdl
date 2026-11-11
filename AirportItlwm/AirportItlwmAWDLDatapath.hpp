@@ -183,6 +183,9 @@ public:
                                            __ATOMIC_ACQUIRE);
     }
 
+private:
+    friend class CallbackLease;
+
     bool enter()
     {
         uint32_t seen = __atomic_load_n(&state_, __ATOMIC_ACQUIRE);
@@ -202,6 +205,7 @@ public:
         __atomic_fetch_sub(&state_, 1u, __ATOMIC_ACQ_REL);
     }
 
+public:
     void close()
     {
         __atomic_fetch_or(&state_, kClosed, __ATOMIC_ACQ_REL);

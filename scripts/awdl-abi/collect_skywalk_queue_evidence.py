@@ -32,6 +32,8 @@ FAMILIES = (
     "IOSkywalkPacketQueue",
     "IOSkywalkPacketBufferPool",
     "IOSkywalkPacket",  # exact 'Class::' match excludes other packet classes
+    "IOSkywalkPacketBuffer",
+    "IOSkywalkPacketTable",
 )
 DEFAULT_METHODS = (
     "legacyDequeue",
@@ -56,6 +58,9 @@ DEFAULT_METHODS = (
     "completeWithQueue",
     "disposePacket",
     "finalize",
+    "checkOutPacketQueue",
+    "flushAllPackets",
+    "disposePacketBuffer",
 )
 
 

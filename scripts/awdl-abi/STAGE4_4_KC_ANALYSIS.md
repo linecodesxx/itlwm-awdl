@@ -547,3 +547,117 @@ Collect `IOSkywalkTxSubmissionQueue::purgePackets()`,
 `IOSkywalkPacketBuffer::completeWithQueue()` bodies and inspect
 `TxSubmissionQueue::initWithPool` to establish callback/refCon
 storage and scheduling. Do not change runtime flags.
+
+
+
+## 14. TX purge and completion routing from local 25G332 KC (2026-11-11)
+
+**Evidence:** the developer-provided local log of `OSSet` vtable names,
+`IOSkywalkTxSubmissionQueue::purgePackets` and its `.cold.1` body,
+`IOSkywalkPacket::complete`, `IOSkywalkPacketBuffer::complete`,
+and both `IOSkywalk{Packet,PacketBuffer}::completeWithQueue` bodies.
+Only summarized behavior is recorded in this public report, not raw disassembly.
+
+### 14.1 OSSet operation names independently confirmed
+
+`OSSet` object-vptr offsets:
+
+| vptr offset | Method | Local KC address |
+|---|---|---|
+| `0x1c0` | `OSSet::setObject(OSMetaClassBase const*)` | `0xffffff8000a49760` |
+| `0x1d8` | `OSSet::removeObject(OSMetaClassBase const*)` | `0xffffff8000a49860` |
+| `0x1e0` | `OSSet::containsObject(OSMetaClassBase const*) const` | `0xffffff8000a498d0` |
+
+This resolves the previously unidentified set operations used by
+`PacketBufferPool::checkInPacketQueue()` and
+`checkOutPacketQueue()`. The pool keeps a set of registered queues
+and a related collection; this is evidence of registration
+bookkeeping, **not** automatic proof that the workloop stops
+scheduling the queue callback.
+
+### 14.2 TX submission purge: two stores of outstanding packets
+
+`IOSkywalkTxSubmissionQueue::purgePackets()` at
+`0xffffff8002b12870` returns immediately if the event-source
+workloop pointer at `queue+0x30` is null. Otherwise it calls its
+`.cold.1` helper at `0xffffff8002b32015`.
+
+Within the workloop-attached case, the helper:
+
+1. Calls `IOEventSource::closeGate`.
+2. Calls `IOSkywalkPacketTable::flushAllPackets` with the TX
+   submission table at `queue+0xe8` and pool at `queue+0x50`.
+   The previously reviewed flush method cancels per-packet
+   completion callbacks and batch-deallocates pending entries.
+3. Separately walks a linked packet chain from `queue+0x108`:
+   obtains `getNextPacket`, unlinks each wrapper, invokes
+   `cancelCompletionCallback`, and invokes the pool's
+   `deallocatePacket` (object-vptr `+0x140`) for each packet.
+4. Clears queue fields `+0x150`, `+0x110`, and `+0x108`.
+5. If `queue+0xf8` is set, calls `_ifnet_purge`.
+6. Reopens the event-source gate.
+
+**New insight:** TX cleanup handles **both** the ring/table and
+the separate linked list, and the native pool return is real.
+However, `purgePackets()` is called on the successful
+`TxSubmissionQueue::finalize()` path; the shown code does not
+prevent a new queue callback from starting **after** the gate is
+reopened, nor does it itself prove driver-side callback refCon
+lifetime safety. The no-workloop early return must not be
+interpreted as proof of no outstanding packets without other
+initialization/finalization invariants.
+
+### 14.3 Packet and buffer completion routing
+
+`IOSkywalkPacket::complete(IOSkywalkPacketQueue*, unsigned)`
+at `0xffffff8002b0b6ae`:
+
+- Returns 0 immediately when wrapper flag `+0x58 & 0x2` is clear.
+- If set, obtains direction from `queue->getDirection()` when
+  the queue is non-null, or uses direction 0.
+- Tail-calls the packet virtual `+0x198`, resolved as
+  `IOSkywalkPacket::completeWithQueue`, passing direction and flags.
+
+`IOSkywalkPacketBuffer::complete(unsigned)` at
+`0xffffff8002b0bd14` is a short no-op returning 0.
+This does not mean `completeWithQueue()` is a no-op.
+
+`IOSkywalkPacketBuffer::completeWithQueue(queue,direction,flags)`
+at `0xffffff8002b0bde8`:
+
+- If direction/mode equals 2 and buffer field `+0x30` is
+  non-null, calls `IOSkywalkPacketBuffer::finalize()`.
+- Clears buffer flag `+0x78 & 0x2`.
+- If the object pointer stored at `buffer+0x48` is non-null,
+  dispatches a virtual callback at that object's vptr `+0x228`.
+- Returns 0.
+
+The outer `IOSkywalkPacket::completeWithQueue()` iterates
+buffers through the same method, may call native
+`_kern_packet_finalize` when direction/mode is 2, may invoke
+an additional callback via packet `+0x38`, clears state
+and tail-calls `IOSkywalkPacket::complete()` (guarded by its
+prepared-bit check). The exact callback owners and their
+lifetime synchronization remain unverified.
+
+### 14.4 Implications and remaining blockers
+
+- `cancelCompletionCallback()` clears object pointers but
+  does not wait for callbacks that are already executing.
+- `purgePackets()` provides real outstanding packet cleanup,
+  but it is **not** proven to revoke the TX Submission Queue
+  callback function/refCon or remove the event source from
+  its owning workloop.
+- Pool registration set operations and deferred pool tasks
+  must be included in any eventual teardown ordering.
+- `TxCallbackContext` currently lives **inside** `SkywalkBackend`
+  and the backend is not retain-counted by Skywalk. Freeing the
+  backend while a callback can still dereference refCon would
+  create a use-after-free even if the callback gate was closed.
+
+**Recommendation for Stage 4.5:** trace queue initialization and
+workloop callback registration/removal from the **caller side**,
+then write an explicit two-phase `detach -> no future entry ->
+drain -> destroy` protocol. Do not wire live Skywalk queues,
+claim packets, or flip `ITLWM_AWDL_DATAPATH_LIVE` until those
+guarantees have independent evidence.

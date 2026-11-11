@@ -142,6 +142,20 @@ struct TxAction {
     void *context;
 };
 
+/*
+ * Pure C++ callback dispatch used by the real Skywalk trampoline and host
+ * tests. Return the number CONSUMED, not the number actually transmitted.
+ * This stage's manager action always returns zero. No packet is freed here.
+ */
+inline uint32_t dispatchTxAction(const TxAction &action,
+                                 void *const *packets, uint32_t count)
+{
+    if (action.dequeue == nullptr || packets == nullptr || count == 0)
+        return 0;
+    uint32_t consumed = action.dequeue(action.context, packets, count);
+    return consumed <= count ? consumed : 0;
+}
+
 class Backend {
 public:
     virtual ~Backend() {}

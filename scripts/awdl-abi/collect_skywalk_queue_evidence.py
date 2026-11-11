@@ -97,6 +97,8 @@ def main():
     parser.add_argument("--wtlkcabi", default=DEFAULT_WTL)
     parser.add_argument("--out", default=DEFAULT_OUT)
     parser.add_argument("--list-only", action="store_true")
+    parser.add_argument("--classes", default=",".join(FAMILIES),
+                        help="Comma-separated class names (restrict candidates)")
     parser.add_argument("--methods", default=",".join(DEFAULT_METHODS),
                         help="Comma-separated exact method names")
     parser.add_argument("--max-functions", type=int, default=30)
@@ -114,15 +116,20 @@ def main():
     from kcfile import KC
     kc = KC(args.kc)
 
+    selected_classes = [name.strip() for name in args.classes.split(",")
+                        if name.strip()]
+    unknown = sorted(set(selected_classes) - set(FAMILIES))
+    if not selected_classes or unknown:
+        parser.error("unknown or empty class selection: %s" % ", ".join(unknown))
     candidates = [symbol for symbol in kc.byname
-                  if any(family in symbol for family in FAMILIES)
+                  if any(family in symbol for family in selected_classes)
                   and symbol.startswith("__Z")]
     names = demangle(candidates)
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     method_set = set(methods)
     items = []
     for mangled, decoded in names.items():
-        cls = next((f for f in FAMILIES if f + "::" in decoded), None)
+        cls = next((f for f in selected_classes if f + "::" in decoded), None)
         meth = method_name(decoded)
         if cls is None or meth not in method_set:
             continue
@@ -132,7 +139,7 @@ def main():
             continue
         if not address:
             continue
-        items.append((methods.index(meth), FAMILIES.index(cls), decoded,
+        items.append((methods.index(meth), selected_classes.index(cls), decoded,
                       mangled, address))
     items.sort()
     print("KC:", args.kc)

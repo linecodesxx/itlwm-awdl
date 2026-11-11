@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Stage 4: verify the experimental AWDL datapath resource manager.
+Stage 4–4.3: verify fail-closed AWDL datapath and host packet ownership.
 
 The Stage 4 manager owns five Skywalk resources (TX pool, RX pool, TX
 submission queue, TX completion queue, RX completion queue) but must never
 register, attach, start or transmit. This script proves the parts that can be
 proved without loading the kext:
 
+  * the separate host-only Stage 4.3 packet ownership tests compile, pass,
+    and remain isolated from the experimental kernel datapath;
   * the host test builds cleanly with -Wall -Wextra -Werror and passes every
     state-machine, reverse-rollback and exactly-once ledger check;
   * the source keeps both compile-time gates closed

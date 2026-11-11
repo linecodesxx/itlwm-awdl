@@ -1572,10 +1572,11 @@ inlining, other classes and truncated
 functions are not captured. **A no-hit
 result is NOT evidence of callback
 quiescence or teardown correctness.**
-We also need to inspect
-`IOSkywalkInterface::init/handleOpen`
-to identify the private object's type
-before interpreting `handleClose+0x1d8`.
+The subsequent local `IOSkywalkInterface::init`
+identified **`OSSet::withCapacity(2)`** as the
+private object, so `handleOpen/handleClose`
+virtuals `+0x1c0/+0x1d8` must be mapped on
+**OSSet**, not the TX queue. See section 30.
 
 ### Next read-only local checks (each ends in cat)
 
@@ -1606,3 +1607,74 @@ public GitHub. Preserve
 and `ITLWM_AWDL_DATAPATH_LIVE=0`
 until the callback entry/barrier protocol
 is proven.
+
+
+
+## Private client OSSet and paged direct-caller scan (2026-11-11)
+
+The developer supplied local Tahoe 25G332
+`IOSkywalkInterface::{init,handleOpen,clientDisconnect}`
+bodies and the initial direct-call scanner summary.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 30 for detailed evidence.
+
+**Confirmed:**
+
+- `IOSkywalkInterface::init()` creates an
+  `OSSet::withCapacity(2)` stored at
+  `interface+0xa8 -> private+0x0` and an
+  `IOLock` stored at `private+0x10`.
+- `handleOpen` calls vptr `+0x1c0`
+  on this `OSSet`, `handleClose`
+  calls `+0x1d8`, both under the IOLock.
+  These are *not* TX queue callbacks.
+  The OSSet vtable entries remain to be mapped.
+- `clientDisconnect` is a no-op in this class.
+- First bounded direct-call search examined
+  **180 of 2353** candidate symbolic functions,
+  found **zero direct target calls**, with
+  zero disassembly failures and truncated
+  bodies. This is not evidence no relevant
+  virtual/indirect calls exist.
+- Scanner now accepts `--skip-functions`
+  for deterministic later slices and
+  records coverage bounds. No runtime
+  path was modified.
+
+### Next bounded read-only evidence (both outputs end in cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes OSSet \\
+  --offsets 0x1c0,0x1d8 \\
+  > /tmp/awdl-osset-client-slots.txt
+
+cat /tmp/awdl-osset-client-slots.txt
+
+python3 scripts/awdl-abi/scan_skywalk_direct_calls.py \\
+  --families IOSkywalk,IOUserNetwork,IOEthernet \\
+  --skip-functions 180 --max-functions 180 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-direct-callers-180-360.txt
+
+cat /tmp/awdl-skywalk-direct-callers-180-360.txt
+```
+
+The OSSet slot check disambiguates
+client registration/removal. The second
+checks the next 180 prioritized named
+functions for direct calls to the
+known 25G332 WorkLoop attach/detach and
+TX packetSubmission addresses. A no-hit
+result still does **not** clear the
+borrowed-`TxCallbackContext` UAF risk;
+virtual calls and owner-side teardown
+remain the principal unanswered questions.
+
+Runtime AWDL flags remain disabled:
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`,
+`ITLWM_AWDL_DATAPATH_LIVE=0`.
+Do not install experimental drivers,
+change EFI or publish KC disassembly.

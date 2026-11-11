@@ -484,3 +484,21 @@ work is behavioural and payload-level, not slot discovery:
 5. Keep `setVIRTUAL_IF_CREATE` fail-closed until that path has been reviewed
    and the runtime gate is deliberately armed.
 6. Only then consider allocating or advertising an AWDL interface.
+
+
+## Stage 4.2 — callback admission safety (experimental, no runtime activation)
+
+The Stage 4.2 review branch adds an atomic, initially disarmed `CallbackGate`
+and an RAII `CallbackLease`. The kernel callback is gated, so no packets can
+be accepted while runtime gates are closed. A TX queue's teardown closes the
+admission gate before releasing the queue. Host tests now include callback
+close/drain ordering, concurrent close and reentrant manager transitions.
+
+**An empty in-flight counter is not proof of Skywalk callback quiescence.**
+Kernel-side proof that callbacks cannot run again after backend destruction,
+plus full TX completion/RX packet ownership semantics, are still required.
+Do not enable `ITLWM_AWDL_DATAPATH_LIVE` or AWDL registration.
+
+See [STAGE4_2_SAFETY_REVIEW.md](STAGE4_2_SAFETY_REVIEW.md) for test commands,
+open risks and the implementation boundary. This branch needs new local
+macOS Tahoe builds and checks before it can be considered validated.

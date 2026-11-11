@@ -165,7 +165,10 @@ static void test_callback_dispatch()
 static void test_callback_gate()
 {
     CallbackGate disarmed;
-    CHECK(!disarmed.enter());
+    {
+        CallbackLease admission(disarmed);
+        CHECK(!admission.acquired());
+    }
     CHECK(disarmed.activeCount() == 0);
     CHECK(disarmed.drained());
     CHECK(!disarmed.closed());
@@ -173,30 +176,41 @@ static void test_callback_gate()
     CallbackGate gate;
     CHECK(gate.arm());
     CHECK(!gate.arm()); /* cannot arm twice */
-    CHECK(gate.enter());
-    CHECK(gate.activeCount() == 1);
     {
-        CallbackLease second(gate);
-        CHECK(second.acquired());
-        CHECK(gate.activeCount() == 2);
+        CallbackLease first(gate);
+        CHECK(first.acquired());
+        CHECK(gate.activeCount() == 1);
+        {
+            CallbackLease second(gate);
+            CHECK(second.acquired());
+            CHECK(gate.activeCount() == 2);
 
-        gate.close();
-        CHECK(gate.closed());
-        CHECK(!gate.enter()); /* close prevents new admissions */
-        CHECK(!gate.drained());
-        CHECK(!gate.arm());   /* permanently closed */
+            gate.close();
+            CHECK(gate.closed());
+            {
+                CallbackLease denied(gate);
+                CHECK(!denied.acquired());
+            }
+            CHECK(!gate.drained());
+            CHECK(!gate.arm()); /* permanently closed */
+        }
+        CHECK(gate.activeCount() == 1);
     }
-    CHECK(gate.activeCount() == 1);
-    gate.leave();
     CHECK(gate.drained());
-    CHECK(!gate.enter());
+    {
+        CallbackLease denied(gate);
+        CHECK(!denied.acquired());
+    }
     gate.close(); /* idempotent */
     CHECK(gate.drained());
 
     CallbackGate closedBeforeArm;
     closedBeforeArm.close();
     CHECK(!closedBeforeArm.arm());
-    CHECK(!closedBeforeArm.enter());
+    {
+        CallbackLease denied(closedBeforeArm);
+        CHECK(!denied.acquired());
+    }
     CHECK(closedBeforeArm.drained());
 }
 
@@ -225,7 +239,10 @@ static void test_callback_gate_concurrent_close()
     if (entered.load(std::memory_order_acquire)) {
         CHECK(gate.activeCount() == 1);
         gate.close();
-        CHECK(!gate.enter());
+        {
+            CallbackLease denied(gate);
+            CHECK(!denied.acquired());
+        }
         CHECK(!gate.drained());
     } else {
         CHECK(false); /* worker did not enter within bounded wait */

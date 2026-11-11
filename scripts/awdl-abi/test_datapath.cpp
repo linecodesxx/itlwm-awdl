@@ -63,7 +63,7 @@ public:
     {
         record('3');
         queueCreates++;
-        if (action.dequeue == nullptr)
+        if (action.invoke == nullptr)
             callbacksNonNull = false;
         (void)pool;
         return failNow() ? nullptr : (void *)0x200;
@@ -155,7 +155,7 @@ static void test_callback_dispatch()
     CHECK(dispatchTxAction(action, packets, 0) == 0);
     CHECK(probe.calls == 2);
 
-    action.dequeue = nullptr;
+    action.invoke = nullptr;
     CHECK(dispatchTxAction(action, packets, 1) == 0);
     CHECK(probe.calls == 2);
 }

@@ -435,3 +435,57 @@ proprietary disassembly to a public GitHub repository.
 but safe refCon lifetime and complete callback quiescence
 are **not proven**. Keep `ITLWM_AWDL_DATAPATH_LIVE=0` and
 AWDL registration disabled. No runtime code changes made.
+
+
+
+## TX purge, OSSet mapping and completion routing (2026-11-11)
+
+The developer provided local vtable names and the six matching function
+bodies in `awdl-skywalk-purge-complete.txt`. See
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md), section 14.
+
+- `OSSet` virtual offsets `0x1c0`, `0x1d8`, `0x1e0`
+  are `setObject`, `removeObject`, `containsObject`.
+  They identify the pool's queue registration collection operations.
+- `IOSkywalkTxSubmissionQueue::purgePackets` under an existing
+  workloop gate flushes pending ring entries via
+  `PacketTable::flushAllPackets`, then separately cancels
+  per-packet callbacks and deallocates entries linked from
+  `queue+0x108`; optionally invokes `_ifnet_purge` and
+  reopens the gate.
+- `IOSkywalkPacket::complete` is flag-sensitive and can
+  tail-call `completeWithQueue`; the packet-buffer
+  `completeWithQueue` path can invoke an object callback
+  stored at `buffer+0x48`. Simply clearing callback pointers
+  is not a callback-draining synchronization operation.
+- Native pool return and queued TX cleanup are both evidenced.
+  The remaining safety issue is proving **no future Skywalk callback
+  entry** after TX Submission Queue teardown, plus draining all
+  already-admitted references to `TxCallbackContext`.
+
+### Next read-only check: submission callback entry and registration
+
+The collector now has a `--classes` filter to avoid unrelated
+RX/TX completion queue methods. Run this next (including the
+requested `cat`):
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkTxSubmissionQueue \\
+  --methods initWithPool,checkForWork,packetSubmission \\
+  --max-functions 12 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-tx-entry.txt
+
+cat /tmp/awdl-skywalk-tx-entry.txt
+```
+
+The collected code can help determine callback/refCon storage,
+how queued TX work is scheduled and what queue states are tested
+before invoking the registered callback. It is **not** a substitute
+for tracing the owner-side workloop removal and queue lifetime.
+Never post raw KC disassembly to the public repository.
+
+**No changes to production kext, runtime flags or EFI.**

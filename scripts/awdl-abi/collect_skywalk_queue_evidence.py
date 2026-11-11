@@ -34,6 +34,8 @@ FAMILIES = (
     "IOSkywalkPacket",  # exact 'Class::' match excludes other packet classes
     "IOSkywalkPacketBuffer",
     "IOSkywalkPacketTable",
+    "IOSkywalkNetworkInterface",
+    "IOSkywalkQueueSet",
     "IOWorkLoop",
     "IOEventSource",
     "IOCommandGate",
@@ -106,6 +108,8 @@ def main():
     parser.add_argument("--wtlkcabi", default=DEFAULT_WTL)
     parser.add_argument("--out", default=DEFAULT_OUT)
     parser.add_argument("--list-only", action="store_true")
+    parser.add_argument("--all-methods", action="store_true",
+                        help="Discover all named class methods (requires --list-only)")
     parser.add_argument("--classes", default=",".join(FAMILIES),
                         help="Comma-separated class names (restrict candidates)")
     parser.add_argument("--methods", default=",".join(DEFAULT_METHODS),
@@ -114,6 +118,8 @@ def main():
     parser.add_argument("--max-lines", type=int, default=450)
     args = parser.parse_args()
 
+    if args.all_methods and not args.list_only:
+        parser.error("--all-methods requires --list-only (no bulk disassembly)")
     if args.max_functions < 1 or args.max_lines < 1:
         parser.error("--max-functions and --max-lines must be positive")
     if not os.path.isfile(args.kc):
@@ -140,7 +146,7 @@ def main():
     for mangled, decoded in names.items():
         cls = next((f for f in selected_classes if f + "::" in decoded), None)
         meth = method_name(decoded)
-        if cls is None or meth not in method_set:
+        if cls is None or (not args.all_methods and meth not in method_set):
             continue
         try:
             address = kc.find(mangled)
@@ -148,7 +154,8 @@ def main():
             continue
         if not address:
             continue
-        items.append((methods.index(meth), selected_classes.index(cls), decoded,
+        rank = 0 if args.all_methods else methods.index(meth)
+        items.append((rank, selected_classes.index(cls), decoded,
                       mangled, address))
     items.sort()
     print("KC:", args.kc)

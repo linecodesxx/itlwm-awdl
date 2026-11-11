@@ -1765,3 +1765,181 @@ callback entry.
 **Do not enable AWDL runtime registration or
 datapath while these ownership constraints
 remain unproven.**
+
+
+
+## 24. QueueSet and LogicalLink teardown implementation in 25G332 (2026-11-11)
+
+**Source:** developer-provided local kernel collection log containing
+`IOSkywalkQueueSet::{initialize,setEnable,finalize,free}` and
+`IOSkywalkLogicalLink::{setInterface,free}`. Each symbol/body
+was captured from `BootKernelExtensions.kc` on Tahoe 25G332.
+This public report contains only derived observations, **not**
+the proprietary assembly.
+
+### 24.1 QueueSet enable/disable dispatch is explicit
+
+`IOSkywalkQueueSet::setEnable(bool)`
+at `0xffffff8002b189ce` iterates the *all-queues* array
+`QueueSet+0x18` of length `QueueSet+0x58`.
+
+It computes an object-vptr offset from the bool:
+`+0x150` for `true`, `+0x158` for `false`
+and dispatches every queue through this virtual slot.
+From the earlier queue lifecycle/vtable evidence, these
+correspond to queue `enable()` and `disable()`.
+
+**Important:** `setEnable` returns 0 and does not check
+individual queue method results. It does **not** call
+`IOWorkLoop::removeEventSource()` in the shown body.
+Disable is a *state transition*, not independently
+a no-future-TX-callback or queue-detach guarantee.
+
+### 24.2 QueueSet initialize and finalize operate on selected categories
+
+`IOSkywalkQueueSet::initialize(void*, uint64_t, void*)`
+at `0xffffff8002b18a22`:
+
+1. Rejects a null first argument with `0xe00002c2`.
+2. Invokes a `QueueSet` virtual at `+0x128`, passing its
+   second argument; **target identity not yet resolved**.
+3. On success stores the supplied first pointer in
+   `QueueSet+0x48`.
+4. Iterates the categorized array `+0x28` (count `+0x68`),
+   calling each queue virtual `+0x1b8`
+   (`initialize(nullptr)`) and then `+0x218`
+   with additional arguments including `0x50000`.
+5. Iterates another categorized array `+0x30`
+   (count `+0x70`), invoking queue virtual
+   `+0x1b8` (`initialize(nullptr)`).
+6. On failure in either category, calls the QueueSet's
+   `finalize()` and returns the original error.
+
+`IOSkywalkQueueSet::finalize()` at
+`0xffffff8002b18afa` iterates these **same two**
+categorized arrays `+0x28` and `+0x30`,
+calling each queue virtual `+0x1c0`,
+corresponding to `finalize()` for the reviewed
+packet queue class. It then clears `QueueSet+0x48`
+and `+0x50` and returns 0. The method does not
+check each queue finalization status; the earlier TX
+queue finalize can have status-dependent behavior,
+so this call chain alone is **not evidence that every
+queue was successfully finalized**. The other
+queue categories in the all-queues array are not
+iterated by this method.
+
+No direct WorkLoop event-source removal is shown
+in either QueueSet method.
+
+### 24.3 QueueSet free releases its retained queue references
+
+`IOSkywalkQueueSet::free()` at
+`0xffffff8002b18846` walks all
+`QueueSet+0x18` queue pointers and, for each:
+
+- explicitly calls `IOSkywalkPacketQueue::setQueueSet(nullptr)`;
+- calls the queue virtual `+0x28` (`release()`);
+- clears the array entry.
+
+It then frees the categorized arrays at
+`+0x20/+0x28/+0x30/+0x38`, all-queue array
+at `+0x18`, and optional nexus info at
+`+0x40`, before calling its superclass `free()`.
+
+This complements section 23.1, where
+`initWithQueues()` retained each queue.
+**No explicit queue `disable()`, `finalize()`,
+or `removeEventSource()` is present in
+the body of QueueSet `free()`.**
+Whether these happen earlier in a separate
+shutdown method or through superclass/owner
+code must be evaluated separately.
+
+### 24.4 LogicalLink setInterface changes pool bookkeeping
+
+`IOSkywalkLogicalLink::setInterface(IOSkywalkNetworkInterface*)`
+at `0xffffff8002b116d6` stores the interface
+pointer in `LogicalLink+0x18`, traverses each
+associated QueueSet and its all-queues array,
+obtains each queue's packet pool through a
+virtual at `queue+0x1e8` (exact method label
+to confirm), then:
+
+- For non-null interface: calls
+  `IOSkywalkPacketBufferPool::checkInPacketQueue(queue)`
+  and sets `queue->ownerId` to the interface
+  registry-entry ID.
+- For null interface: calls
+  `IOSkywalkPacketBufferPool::checkOutPacketQueue(queue)`
+  and sets `queue->ownerId` to 0.
+
+**Caution:** pool check-in/check-out is
+collection bookkeeping, **not** the same
+as `IOWorkLoop::addEventSource` or
+`removeEventSource`. In particular,
+`setInterface(nullptr)` does not establish
+callback quiescence or revoke a borrowed refCon.
+
+### 24.5 LogicalLink free has an important unidentified pre-release step
+
+`IOSkywalkLogicalLink::free()` at
+`0xffffff8002b11538` frees its ancillary
+nexus/metadata allocation, then iterates its
+QueueSet array at `LogicalLink+0x10`
+(count `LogicalLink+0x28`). For each QueueSet:
+
+1. Calls **QueueSet virtual `+0x118`** with
+   argument `nullptr`: the vtable target has
+   not yet been mapped on this KC and MUST NOT
+   be named by inference.
+2. Calls `IOSkywalkQueueSet::setLogicalLink(nullptr)`
+   directly.
+3. Calls QueueSet virtual `+0x28` (`release()`),
+   clears the pointer slot, then frees the array
+   and tails to superclass `free()`.
+
+A particularly important next question is whether
+the unknown `QueueSet+0x118` is a disable/
+shutdown method or another operation, and
+whether it is sufficient to prevent WorkLoop-
+driven and external TX callback entry.
+
+There are **no directly identified calls**
+to `IOWorkLoop::removeEventSource()` in
+the shown LogicalLink bodies.
+
+### 24.6 Safety verdict and next targeted mapping
+
+The owner/reference chain is now backed by
+both construction and destruction bodies:
+
+```text
+NetworkInterface -> LogicalLink
+  -> QueueSet -> TX/RX PacketQueue(s)
+                     -> PacketBufferPool
+```
+
+`QueueSet::setEnable(false)` disables each
+queue; `QueueSet::finalize()` finalizes
+selected queue categories; `QueueSet::free()`
+releases held references. `LogicalLink::setInterface(nullptr)`
+unregisters queues from their pools, while
+`LogicalLink::free()` performs an *as-yet
+unmapped* QueueSet virtual before its release.
+
+**Unproven:** that the higher-level owner invokes
+these lifecycle stages in an appropriate order,
+that all event sources are detached from their
+WorkLoops, that no direct `packetSubmission()`
+can subsequently enter, and that all already-
+executing calls using `TxCallbackContext` exit
+before its memory is freed.
+
+Next inspect `IOSkywalkQueueSet` vptr
+`+0x118/+0x128` and queue
+`+0x1b8/+0x1c0/+0x1e8/+0x218`,
+and `IOEventSource::free()` to assess
+inherited detach behavior. Keep
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`
+and `ITLWM_AWDL_DATAPATH_LIVE=0`.

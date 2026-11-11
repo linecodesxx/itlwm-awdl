@@ -2902,3 +2902,137 @@ Both experimental flags remain disabled:
 `ITLWM_AWDL_DATAPATH_LIVE=0`.
 No live kext, EFI or native AWDL queue
 modification is authorized by this research.
+
+
+
+## 32. WorkLoop add/remove vptr slots and third bounded indirect-caller scan (2026-11-11)
+
+**Evidence:** developer-supplied local 25G332 `IOWorkLoop`
+vtable report and `scan_skywalk_direct_calls.py` summary
+for ranked functions `[360,540)` out of 2353
+selected symbols. No verbatim Apple KC code is included.
+
+### 32.1 Exact WorkLoop event-source attachment and removal slots
+
+`IOWorkLoop` object-vptr offsets (not raw
+`__ZTV` symbol offsets) were directly resolved:
+
+| WorkLoop object-vptr slot | KC method | Local address |
+|---|---|---|
+| `+0x140` | `IOWorkLoop::addEventSource(IOEventSource*)` | `0xffffff8000acaf80` |
+| `+0x148` | `IOWorkLoop::removeEventSource(IOEventSource*)` | `0xffffff8000acb070` |
+| `+0x150` | `enableAllEventSources()` | `0xffffff8000acb0a0` |
+| `+0x158` | `disableAllEventSources()` | `0xffffff8000acb120` |
+| `+0x170` | `signalWorkAvailable()` | `0xffffff8000acb290` |
+| `+0x178` | `openGate()` | `0xffffff8000acb340` |
+| `+0x180` | `closeGate()` | `0xffffff8000acb3b0` |
+| `+0x1a8` | `runEventSources()` | `0xffffff8000acb650` |
+
+This supplies the precise vtable offsets
+`+0x140` and `+0x148` for **type-aware
+indirect caller searches**. The existing
+direct-call scanner already knows the two
+absolute target addresses. Do not treat a
+match at `+0x148` as confirmed
+`removeEventSource` until the caller's
+receiver is shown to be an IOWorkLoop
+or a compatible subclass.
+
+### 32.2 Third bounded search returned four unrelated slot candidates
+
+The local scanner used method name prefixes
+`IOSkywalk,IOUserNetwork,IOEthernet`,
+`--skip-functions 360 --max-functions 180`,
+`--max-lines 450`, and candidate virtual
+offsets `0x1d8,0x120,0x150,0x158,0x1c0`.
+
+Results:
+
+- `[360,540)` — 180 inspected symbolic
+  functions, 0 direct hits to the three
+  named `25G332` targets.
+- 0 disassembly failures and 0 truncated
+  bodies.
+- **4 candidate indirect calls** matching
+  requested textual slot patterns:
+
+| Candidate method | Function address | Indirect slot | Call-site address |
+|---|---|---|---|
+| `IOEthernetInterface::inputEvent` | `0xffffff80026f4f8a` | `+0x158` | `0xffffff80026f5066` |
+| `IOEthernetInterface::setFilters` | `0xffffff80026f32f8` | `+0x1c0` | `0xffffff80026f335d` |
+| `IOSkywalkBSDClient::finiRing` | `0xffffff8002b0281c` | `+0x1c0` | `0xffffff8002b02834` |
+| `IOSkywalkCloneableNetworkPacket::getPacketBufferObjectIOBusBaseAddr` | `0xffffff8002b0d424` | `+0x158` | `0xffffff8002b0d4ca` |
+
+These **do not include `+0x140` or
+`+0x148`**, which were not requested
+in this batch; no claim about their
+absence follows. The other offsets
+are heavily reused between unrelated
+objects; the report does not expose
+receiver type or prove any candidate
+invokes a TX queue or a WorkLoop.
+
+`IOSkywalkBSDClient::finiRing` is an
+interesting potential lifecycle location
+by name, **not** evidence that its
+`+0x1c0` indirect target is the
+queue `finalize()`. Receiver-provenance
+analysis is mandatory before labeling it.
+
+### 32.3 Combined coverage is still partial
+
+The three nonoverlapping scanner batches
+`[0,180)`, `[180,360)`, `[360,540)`
+cover **540/2353 = 22.95%** of the
+scanner's ranked candidate functions.
+They produced no direct hits to known
+WorkLoop add/remove or TX packetSubmission
+entry addresses. Four candidate indirect
+offset matches came from the third batch.
+
+**Limitations:** the current scanner's
+indirect mode recognizes only the specific
+`call/jmp qword ptr [register + offset]`
+textual shape. It misses calls routed through
+a register loaded from a vtable, wrappers
+outside the chosen symbol families,
+inlined code, other compilation forms,
+and functions beyond the selected range.
+An unmatched function does not prove
+the absence of workloop registration.
+
+### 32.4 Change in strategy: focus on true attach/detach virtuals
+
+Next apply `--virtual-offsets 0x140,0x148`
+to a **targeted family subset** containing
+`IOSkywalk{NetworkInterface,Interface,QueueSet,
+LogicalLink,TxSubmissionQueue,PacketQueue,
+PacketBufferPool}`, instead of
+continuing to treat all similarly named
+queue/ethernet methods as equivalent.
+The scanner's `--families` argument
+accepts comma-separated leading
+demangled owner/class prefixes. A
+matching indirect slot remains a
+*call-site candidate*, never a verified
+WorkLoop call until the receiver is traced.
+
+Optionally scan the next ranked general
+slice `[540,720)` specifically for
+`+0x140/+0x148`; interpret results as
+bounded evidence rather than total coverage.
+If matches are found, retrieve the
+exact few caller bodies to trace the
+object on which the vtable call occurs.
+
+**Safety invariant unchanged:**
+`TxCallbackContext` is embedded in
+`SkywalkBackend` and the kernel
+callback receives a borrowed `refCon`.
+Nothing so far proves stopping future
+direct TX callback entry plus draining
+in-flight callbacks before that
+context is destroyed. Keep
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`
+and `ITLWM_AWDL_DATAPATH_LIVE=0`;
+do not change runtime, EFI, or live kexts.

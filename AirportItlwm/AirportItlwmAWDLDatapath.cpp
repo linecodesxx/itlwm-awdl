@@ -90,7 +90,7 @@ uint32_t txSubmissionAction(OSObject *target, IOSkywalkTxSubmissionQueue *,
                             IOSkywalkPacket * const *packets, uint32_t count,
                             void *refCon)
 {
-    const TxCallbackContext *ctx = static_cast<const TxCallbackContext *>(refCon);
+    TxCallbackContext *ctx = static_cast<TxCallbackContext *>(refCon);
     if (ctx == nullptr || ctx->target != target)
         return 0;
     itlwm_awdl_datapath::CallbackLease admission(ctx->gate);

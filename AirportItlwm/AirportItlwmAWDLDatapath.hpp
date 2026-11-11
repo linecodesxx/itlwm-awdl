@@ -156,6 +156,90 @@ inline uint32_t dispatchTxAction(const TxAction &action,
     return consumed <= count ? consumed : 0;
 }
 
+/*
+ * Callback admission gate, independent of IOKit and usable in host tests.
+ * Starts DISARMED and cannot be re-armed after close(). No Stage 4.2 kext
+ * code calls arm(): every production callback is therefore fail-closed.
+ *
+ * close() blocks new admissions and tracks callbacks that entered before it.
+ * drained() only proves that admitted callbacks have exited. It does NOT
+ * prove that Skywalk has stopped calling the callback or can no longer use
+ * the refCon pointer. That requires an independently proven queue-quiescence
+ * contract before freeing the backend/context.
+ *
+ * __atomic builtins avoid an STL dependency in the kernel build.
+ */
+class CallbackGate {
+public:
+    CallbackGate() : state_(0) {}
+    CallbackGate(const CallbackGate &) = delete;
+    CallbackGate &operator=(const CallbackGate &) = delete;
+
+    bool arm()
+    {
+        uint32_t expected = 0;
+        return __atomic_compare_exchange_n(&state_, &expected, kArmed,
+                                           false, __ATOMIC_ACQ_REL,
+                                           __ATOMIC_ACQUIRE);
+    }
+
+    bool enter()
+    {
+        uint32_t seen = __atomic_load_n(&state_, __ATOMIC_ACQUIRE);
+        while ((seen & kArmed) != 0 && (seen & kClosed) == 0 &&
+               (seen & kCountMask) != kCountMask) {
+            if (__atomic_compare_exchange_n(&state_, &seen, seen + 1,
+                                            false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE))
+                return true;
+        }
+        return false;
+    }
+
+    void leave()
+    {
+        /* Caller must hold a successful admission (see CallbackLease). */
+        __atomic_fetch_sub(&state_, 1u, __ATOMIC_ACQ_REL);
+    }
+
+    void close()
+    {
+        __atomic_fetch_or(&state_, kClosed, __ATOMIC_ACQ_REL);
+    }
+
+    bool drained() const { return activeCount() == 0; }
+    bool closed() const
+    {
+        return (__atomic_load_n(&state_, __ATOMIC_ACQUIRE) & kClosed) != 0;
+    }
+    uint32_t activeCount() const
+    {
+        return __atomic_load_n(&state_, __ATOMIC_ACQUIRE) & kCountMask;
+    }
+
+private:
+    static constexpr uint32_t kArmed = 0x40000000u;
+    static constexpr uint32_t kClosed = 0x80000000u;
+    static constexpr uint32_t kCountMask = 0x3fffffffu;
+    uint32_t state_;
+};
+
+class CallbackLease {
+public:
+    explicit CallbackLease(CallbackGate &gate)
+        : gate_(gate), acquired_(gate.enter()) {}
+    ~CallbackLease() { if (acquired_) gate_.leave(); }
+
+    CallbackLease(const CallbackLease &) = delete;
+    CallbackLease &operator=(const CallbackLease &) = delete;
+
+    bool acquired() const { return acquired_; }
+
+private:
+    CallbackGate &gate_;
+    bool acquired_;
+};
+
 class Backend {
 public:
     virtual ~Backend() {}

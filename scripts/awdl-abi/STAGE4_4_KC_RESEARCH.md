@@ -839,3 +839,86 @@ the caller side still requires independent inspection.
 **Guardrails:** never publish raw KC disassembly, never
 enable the experimental AWDL registration/datapath, and
 do not install a research kext.
+
+
+
+## 25G332 TX init/enable/disable and owner discovery (2026-11-11)
+
+The local `awdl-skywalk-tx-attach-lifecycle.txt` output
+reveals both `IOSkywalkPacketQueue` base lifecycle methods
+and TX submission overrides. See
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 21.
+
+**Confirmed:**
+
+- Base queue `initialize()` calls pool
+  `checkInPacketQueue()` and increments
+  `queue+0xbc`. It returns success when the
+  updated count is 1 and `0xe00002d5` when
+  greater than 1. Combined with the matching
+  base `finalize()`, this identifies a
+  queue initialization/finalization balance,
+  **not an in-flight TX callback counter**.
+- `TxSubmissionQueue::initialize()` calls the
+  base method under an existing event-source
+  workloop gate (if present), stores caller
+  data at `+0xe0` and clears work counters on
+  success. It handles the `0xe00002d5`
+  case via virtual `finalize()`.
+- `TxSubmissionQueue::enable()` uses base
+  enable and may directly trigger
+  `packetSubmission(false)` or
+  `sendNotification(0)`.
+- `TxSubmissionQueue::disable()` calls base
+  disable under a temporary event-source gate
+  and reopens the gate. Base disable resets
+  ABFS if present, then calls the inherited
+  event-source disable method.
+- **None of the inspected implementations
+  calls `IOWorkLoop::removeEventSource()`.**
+  This is **not proof** that no higher-level
+  owner performs such removal.
+- **Current speculative Stage 4 backend**
+  uses `q->disable(); q->release();`,
+  which cannot be considered a proven
+  no-future-`refCon` barrier if live allocation
+  were enabled. The actual Stage 4 live gates
+  remain disabled.
+
+### Next read-only owner-side inventory and base enable
+
+The collector now supports `--list-only --all-methods`
+and recognizes `IOSkywalkNetworkInterface` and
+`IOSkywalkQueueSet`. This inventories method names
+without dumping full disassembly. Run:
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkNetworkInterface,IOSkywalkQueueSet \\
+  --all-methods --list-only \\
+  > /tmp/awdl-skywalk-owner-methods.txt
+
+cat /tmp/awdl-skywalk-owner-methods.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkPacketQueue,IOSkywalkTxSubmissionQueue \\
+  --methods enable,free,withPool \\
+  --max-functions 12 --max-lines 350 \\
+  --out /tmp/awdl-skywalk-base-enable-free.txt
+
+cat /tmp/awdl-skywalk-base-enable-free.txt
+```
+
+The first command is a symbol/method inventory only;
+the second is bounded method-specific KC evidence.
+Next research should focus on **actual owner-side**
+event-source `addEventSource/removeEventSource`
+call sites and external TX packet producers.
+
+Do not redistribute raw proprietary KC output or
+enable the AWDL runtime. Production kext and EFI
+remain untouched.

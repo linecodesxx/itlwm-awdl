@@ -43,9 +43,13 @@ def main():
     parser.add_argument('--wtlkcabi', default=DEFAULT_WTL)
     parser.add_argument('--families', default='IOSkywalk,IOUserNetwork,IOEthernet')
     parser.add_argument('--max-functions', type=int, default=180)
+    parser.add_argument('--skip-functions', type=int, default=0,
+                        help='Skip this many ranked unique functions before scanning')
     parser.add_argument('--max-lines', type=int, default=400)
     parser.add_argument('--out', default='/tmp/awdl-skywalk-direct-callers.txt')
     args = parser.parse_args()
+    if args.skip_functions < 0:
+        parser.error('--skip-functions must be nonnegative')
     if args.max_functions <= 0 or args.max_lines <= 0:
         parser.error('limits must be positive')
     if not os.path.isfile(args.kc) or not os.path.isdir(args.wtlkcabi):
@@ -80,7 +84,8 @@ def main():
         if item[2] not in seen_addresses:
             deduped.append(item)
             seen_addresses.add(item[2])
-    selected = deduped[:args.max_functions]
+    start_index = args.skip_functions
+    selected = deduped[start_index:start_index + args.max_functions]
 
     if not os.environ.get('LLVM_OBJDUMP') and os.path.isfile(OBJDUMP_FALLBACK):
         os.environ['LLVM_OBJDUMP'] = OBJDUMP_FALLBACK
@@ -111,6 +116,8 @@ def main():
         out.write('Families: %s\n' % ', '.join(prefixes))
         out.write('Scanned functions: %d / %d matched symbols\n' %
                   (len(selected), len(deduped)))
+        out.write('Selection range (0-based): [%d, %d) of %d\n' %
+                  (start_index, start_index + len(selected), len(deduped)))
         out.write('Disassembly failures: %d; bodies truncated: %d\n' %
                   (errors, truncated))
         out.write('Targets: %s\n' % ', '.join('%s=%#x' % (name, addr)
@@ -126,7 +133,8 @@ def main():
                   'beyond max-lines. No-hit is NOT a safety proof.\n')
         out.write('No proprietary disassembly is included in this report.\n')
     print('Saved interpreted call-site summary:', args.out)
-    print('Scanned:', len(selected), 'of', len(deduped), 'symbolic functions; hits:', len(hits))
+    print('Scanned:', len(selected), 'of', len(deduped), 'symbolic functions; range:',
+          start_index, '-', start_index + len(selected), '; hits:', len(hits))
     return 0
 
 

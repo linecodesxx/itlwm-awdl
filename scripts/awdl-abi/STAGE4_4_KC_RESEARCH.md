@@ -266,13 +266,7 @@ Read-only collector command with `--methods finalize --max-functions 10
 
 Local output: `/tmp/awdl-skywalk-finalize.txt`.
 
-**Only successful extraction and method names/counts are confirmed.**
-The contents of this file and the previously generated
-`/tmp/awdl-skywalk-packet-lifetime.txt` are still needed to analyze
-callback quiescence, TX/RX ownership, packet recycling and teardown.
-The presence of `finalize()` does not itself prove draining or
-safe deletion of a callback context. No runtime gates or driver source
-were changed.
+The full files have subsequently been reviewed; see the dedicated [Stage 4.4 packet-finalize report](STAGE4_4_PACKET_FINALIZE_REVIEW.md). Those methods establish real native TX packet pool-free calls but **do not** establish callback quiescence or safe deletion of callback context. No runtime gates or driver source were changed.
 
 
 ## Full packet-lifetime and finalize review (developer-uploaded, 2026-11-11)
@@ -329,3 +323,12 @@ Send the printed vtable mapping and the new local text file for review.
 The evidence should remain outside public GitHub.
 
 **No production kext files changed; experimental gates stay off.**
+
+
+## Full packet and finalize review completed
+
+Both uploaded evidence files have been reviewed: [STAGE4_4_PACKET_FINALIZE_REVIEW.md](STAGE4_4_PACKET_FINALIZE_REVIEW.md).
+
+The critical outstanding safety issue is proving callback quiescence before freeing the TX submission queue's `refCon`. No `finalize()` body proves that. Additionally, TX completion's `finalize()` masks base code `0xe00002d5` as success while skipping some state cleanup. The observed native TX pool-return calls are `_kern_pbufpool_free` and `_kern_pbufpool_free_batch`, after wrapper disposal. RX's native network handoff is separate.
+
+Next evidence: `IOSkywalkPacketTable::flushAllPackets`, `IOSkywalkPacketBufferPool::completePreparedPacket`/`checkOutPacketQueue`, and vptr offsets `IOSkywalkPacket::0x1a0`, `IOSkywalkPacketBuffer::0x148`, `TxSubmissionQueue::0x2a0`.

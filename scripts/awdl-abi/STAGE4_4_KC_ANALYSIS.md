@@ -927,12 +927,14 @@ redistribute proprietary KC instructions.
   internal command gate (the object's concrete dynamic
   class was not separately proven).
 - `IOCommandGate::runCommand` is a **12-instruction
-  forwarding wrapper**: rearranges registers, loads
-  `gate+0x20` as the owner, and tail-calls
-  `gate->vptr+0x1c8`. **That vtable target is currently
-  unnamed and its body uninspected.** It may supply the
-  command execution/serialization implementation, so do
-  not assert a successful detach solely from this wrapper.
+  forwarding wrapper**: rearranges registers, passes
+  the saved **action function pointer** from `gate+0x20`
+  to `gate->vptr+0x1c8`. The owner's object pointer
+  is instead stored at `gate+0x18`.
+  **Update (2026-11-11):** the local vtable maps
+  `gate->vptr+0x1c8` to `IOCommandGate::runAction`.
+  The saved action pointer itself has not yet been mapped
+  to its 25G332 KC implementation.
 - The `IOWorkLoop` class itself has a reserved symbol
   at vptr `+0x1c0`; that is *not* the callback target
   of the `IOCommandGate` object at `workloop+0x20`.
@@ -959,12 +961,13 @@ redistribute proprietary KC instructions.
 `0xffffff8000acb5f0` similarly enters and exits
 its gate around the supplied function pointer.
 
-**Interpretation limit:** this proves that the underlying
-IOKit framework contains synchronous gate execution and
-waiting mechanisms. It does **not** prove that
-`IOWorkLoop::removeEventSource` uses precisely the
-`runAction` path on this build until the gate's
-virtual `+0x1c8` is resolved and inspected.
+**Update:** the developer's local vtable identifies
+`IOCommandGate::runAction` as virtual slot `+0x1c8`
+on this KC. Therefore the control gate's
+`runCommand -> runAction` portion of the call chain is
+**confirmed**. The specific saved workloop-maintenance action
+and the Skywalk owner's detach order are not yet independently
+verified.
 
 ### 17.3 Event source and command gate detach
 
@@ -1016,3 +1019,76 @@ The exact remaining questions:
 `ITLWM_AWDL_REGISTRATION_ENABLED=0` remain hard gates.
 No native driver, kext, EFI or hardware changes are
 justified by the current analysis.
+
+
+
+## 18. Command-gate target resolved; workloop action is next (2026-11-11)
+
+**Grounding:** user ran the vtable inspection locally on
+macOS Tahoe `25G332`, revealing the following:
+
+| Class / vptr offset | Confirmed target |
+|---|---|
+| `IOCommandGate +0x1c8` | `IOCommandGate::runAction` at `0xffffff8000ace080` |
+| `IOCommandGate +0x158` | `IOCommandGate::disable` at `0xffffff8000acdfe0` |
+| `IOWorkLoop +0x178` | `IOWorkLoop::openGate` |
+| `IOWorkLoop +0x180` | `IOWorkLoop::closeGate` |
+| `IOWorkLoop +0x130` | `IOWorkLoop::onThread` |
+| `IOWorkLoop +0x190` | `IOWorkLoop::sleepGate` |
+| `IOWorkLoop +0x198` | `IOWorkLoop::wakeupGate` |
+| `IOEventSource +0x158` | `IOEventSource::disable` |
+
+### Local call sequence, now resolved
+
+```text
+IOWorkLoop::removeEventSource(queue)
+  -> workloop->controlG->runCommand(op=1, queue)
+  -> IOCommandGate::runCommand
+  -> IOCommandGate::runAction(gate+0x20 action, op=1, queue)
+  -> gate-owner (gate+0x18) + saved action
+```
+
+Unlike an earlier report, `gate+0x20` is the **action function
+pointer** and `gate+0x18` is the **owner** pointer.
+`IOCommandGate::runAction` synchronizes the call under
+the workloop's recursive gate. This provides a plausible
+serialization boundary for events *executed under the same
+workloop gate*, but is **not** yet proof against direct
+packet submission calls outside that gate or against callbacks
+that dereference a freed backend context.
+
+### Comparison against public Apple XNU source
+
+Apple's public `IOWorkLoop.cpp` implements
+`IOWorkLoop::init` by creating a command gate whose
+action is `IOWorkLoop::_maintRequest`.
+The public `_maintRequest` `mRemoveEvent` handler
+unlinks the source from the workloop's active/passive
+chain, calls `setWorkLoop(nullptr)`, clears its
+`next` link, and releases the workloop-held reference,
+under command-gate serialization.
+
+Reference (public XNU **not a confirmed exact 25G332
+binary match**):
+https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOWorkLoop.cpp
+
+This is a valuable architectural cross-check, **not** a
+substitute for checking `IOWorkLoop::_maintRequest`
+against the user's local KC and finding the actual
+Skywalk owner calls to `removeEventSource`.
+
+### Remaining requirements for a future live backend
+
+1. Disassemble local `IOWorkLoop::_maintRequest` and
+   optionally `IOWorkLoop::init`; check exact owner,
+   callback storage and source removal status handling.
+2. Identify direct TX submission producers in addition
+   to workloop `checkForWork`, and define owner-side
+   disable, detach and no-future-entry semantics.
+3. Prove all admitted callbacks exit **after** that
+   barrier, including failed detach/removal branches.
+4. Do not let the currently embedded
+   `SkywalkBackend::txCallbackContext_` be destroyed
+   before these invariants are proven.
+5. Keep `ITLWM_AWDL_DATAPATH_LIVE=0` and
+   AWDL registration disabled. No live packet processing.

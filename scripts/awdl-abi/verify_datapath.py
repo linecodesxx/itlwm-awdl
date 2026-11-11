@@ -191,6 +191,14 @@ def source_gates():
           "receive() zeroes the received count")
     check("kUnsupported" in hpp,
           "transmit()/receive() return kUnsupported when Ready")
+    check("class CallbackGate" in hpp and
+          "class CallbackLease" in hpp and
+          "__atomic_compare_exchange_n" in hpp,
+          "callback admission gate uses host-testable atomic accounting")
+    check("CallbackLease admission(ctx->gate)" in cpp and
+          "admission.acquired()" in cpp and
+          "gate.arm()" not in cpp,
+          "real callback requires admission, and driver never arms gate")
 
     # No registration / attach / start token in the real backend.
     for token in ("registerEthernetInterface", "deregisterEthernetInterface",

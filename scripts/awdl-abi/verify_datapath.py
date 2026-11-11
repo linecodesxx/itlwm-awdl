@@ -37,6 +37,8 @@ DATAPATH_CPP = os.path.join(ROOT, "AirportItlwm", "AirportItlwmAWDLDatapath.cpp"
 DATAPATH_HPP = os.path.join(ROOT, "AirportItlwm", "AirportItlwmAWDLDatapath.hpp")
 AWDL_CPP = os.path.join(ROOT, "AirportItlwm", "AirportItlwmAWDLInterface.cpp")
 TEST_CPP = os.path.join(ROOT, "scripts", "awdl-abi", "test_datapath.cpp")
+PACKET_TEST_CPP = os.path.join(ROOT, "scripts", "awdl-abi", "test_packet_flow.cpp")
+PACKET_FLOW_HPP = os.path.join(ROOT, "AirportItlwm", "AirportItlwmAWDLPacketFlow.hpp")
 
 FACTORY_SYMBOLS = (
     "__ZN25IOSkywalkPacketBufferPool8withNameEPKcP8OSObjectjPKNS_11PoolOptionsE",
@@ -163,9 +165,28 @@ def test_host_manager(outdir):
         print(result.stdout)
 
 
+def test_host_packet_flow(outdir):
+    print("\n[packet flow host tests]")
+    binary = os.path.join(outdir, "test_packet_flow")
+    result = run(["xcrun", "clang++", "-std=c++14", "-Wall", "-Wextra",
+                  "-Werror", "-I", os.path.join(ROOT, "AirportItlwm"),
+                  PACKET_TEST_CPP, "-o", binary])
+    check(result.returncode == 0, "test_packet_flow.cpp builds with -Werror")
+    if result.returncode != 0:
+        print(result.stdout)
+        return
+    result = run([binary])
+    check(result.returncode == 0, "all packet flow host tests pass")
+    check("ALL PACKET FLOW TESTS PASSED" in result.stdout,
+          "packet flow reports success")
+    if result.returncode != 0:
+        print(result.stdout)
+
+
 def source_gates():
     print("\n[source gates]")
     hpp = open(DATAPATH_HPP).read()
+    packet_flow = open(PACKET_FLOW_HPP).read()
     cpp = open(DATAPATH_CPP).read()
     awdl = open(AWDL_CPP).read()
 
@@ -191,6 +212,16 @@ def source_gates():
           "receive() zeroes the received count")
     check("kUnsupported" in hpp,
           "transmit()/receive() return kUnsupported when Ready")
+    check("class Ownership" in packet_flow and
+          "claimBatch(" in packet_flow and
+          "acknowledgeReturn(" in packet_flow and
+          "uint64_t generation" in packet_flow,
+          "host-only ownership model uses generation tickets and explicit pool return")
+    check("AirportItlwmAWDLPacketFlow.hpp" not in cpp and
+          "AirportItlwmAWDLPacketFlow.hpp" not in awdl and
+          "itlwm_awdl_packet_flow" not in cpp and
+          "itlwm_awdl_packet_flow" not in awdl,
+          "packet ownership prototype is not wired into the kernel")
     check("class CallbackGate" in hpp and
           "class CallbackLease" in hpp and
           "__atomic_compare_exchange_n" in hpp,
@@ -282,6 +313,7 @@ def main():
 
     outdir = tempfile.mkdtemp(prefix="itlwm-awdl-datapath-")
     test_host_manager(outdir)
+    test_host_packet_flow(outdir)
     source_gates()
     datapath_object(outdir)
     awdl_isolation(outdir)

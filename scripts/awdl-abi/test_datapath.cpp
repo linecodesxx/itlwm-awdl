@@ -160,6 +160,44 @@ static void test_callback_dispatch()
     CHECK(probe.calls == 2);
 }
 
+static void test_callback_gate()
+{
+    CallbackGate disarmed;
+    CHECK(!disarmed.enter());
+    CHECK(disarmed.activeCount() == 0);
+    CHECK(disarmed.drained());
+    CHECK(!disarmed.closed());
+
+    CallbackGate gate;
+    CHECK(gate.arm());
+    CHECK(!gate.arm()); /* cannot arm twice */
+    CHECK(gate.enter());
+    CHECK(gate.activeCount() == 1);
+    {
+        CallbackLease second(gate);
+        CHECK(second.acquired());
+        CHECK(gate.activeCount() == 2);
+
+        gate.close();
+        CHECK(gate.closed());
+        CHECK(!gate.enter()); /* close prevents new admissions */
+        CHECK(!gate.drained());
+        CHECK(!gate.arm());   /* permanently closed */
+    }
+    CHECK(gate.activeCount() == 1);
+    gate.leave();
+    CHECK(gate.drained());
+    CHECK(!gate.enter());
+    gate.close(); /* idempotent */
+    CHECK(gate.drained());
+
+    CallbackGate closedBeforeArm;
+    closedBeforeArm.close();
+    CHECK(!closedBeforeArm.arm());
+    CHECK(!closedBeforeArm.enter());
+    CHECK(closedBeforeArm.drained());
+}
+
 static Config makeConfig()
 {
     Config c;
@@ -428,6 +466,7 @@ static void test_ledger_exactly_once()
 int main()
 {
     test_callback_dispatch();
+    test_callback_gate();
     test_initial_state();
     test_success_and_teardown();
     test_initialize_twice();

@@ -36,6 +36,7 @@ FAMILIES = (
     "IOSkywalkPacketTable",
     "IOWorkLoop",
     "IOEventSource",
+    "IOCommandGate",
 )
 DEFAULT_METHODS = (
     "legacyDequeue",
@@ -64,6 +65,10 @@ DEFAULT_METHODS = (
     "checkOutPacketQueue",
     "flushAllPackets",
     "disposePacketBuffer",
+    "runAction",
+    "runCommand",
+    "setWorkLoop",
+    "workLoop",
     "purgePackets",
     "complete",
     "cancelCompletionCallback",

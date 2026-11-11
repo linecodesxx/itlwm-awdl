@@ -1755,3 +1755,98 @@ the report.
 No experimental AWDL registration or TX
 datapath, no kext loading or EFI changes.
 Do not publish original Apple KC assembly.
+
+
+
+## WorkLoop add/remove slots and candidate indirect calls (2026-11-11)
+
+The developer supplied the exact local Tahoe 25G332
+`IOWorkLoop` vtable entries and ranked direct/indirect
+call scan for function indices `[360,540)`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md)
+section 32.
+
+**Confirmed virtual identities:**
+
+- `IOWorkLoop` object-vptr `+0x140` =
+  `addEventSource(IOEventSource*)` at
+  `0xffffff8000acaf80`.
+- `IOWorkLoop` object-vptr `+0x148` =
+  `removeEventSource(IOEventSource*)` at
+  `0xffffff8000acb070`.
+- `+0x150/+0x158` = enable/disable **all**
+  event sources, respectively; neither
+  equals queue-specific detach.
+
+**Third scan results:** 180 more function bodies
+(`[360,540)`) produced zero direct hits,
+zero disassembly failures, no truncation
+and four **untyped candidate indirect slots**:
+
+- `IOEthernetInterface::inputEvent`: `+0x158`.
+- `IOEthernetInterface::setFilters`: `+0x1c0`.
+- `IOSkywalkBSDClient::finiRing`: `+0x1c0`.
+- `IOSkywalkCloneableNetworkPacket::getPacketBufferObjectIOBusBaseAddr`:
+  `+0x158`.
+
+No matches at `+0x140/+0x148` were tested
+in this batch because those offsets were
+**not included** in its request. Their
+presence/absence must be checked in a
+new scan. Do not infer caller receiver
+types from offset equality.
+
+Combined ranked coverage is **540/2353
+(22.95%)**, with zero *direct* calls to
+the known WorkLoop attach/detach and TX
+packetSubmission addresses. This is not
+a uniform sample and cannot prove no
+virtual or external callbacks remain.
+The scanner's documented limitations have
+also been clarified: opt-in slot checks
+recognize only `call/jmp qword ptr
+[reg + offset]` syntax and do not trace
+virtual receiver type.
+
+### Next two targeted read-only outputs (each with cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/scan_skywalk_direct_calls.py \\
+  --families IOSkywalkNetworkInterface,IOSkywalkInterface,IOSkywalkQueueSet,IOSkywalkLogicalLink,IOSkywalkTxSubmissionQueue,IOSkywalkPacketQueue,IOSkywalkPacketBufferPool \\
+  --max-functions 500 --max-lines 500 \\
+  --virtual-offsets 0x140,0x148,0x1d8 \\
+  --max-virtual-hits 80 \\
+  --out /tmp/awdl-owner-workloop-slots.txt
+
+cat /tmp/awdl-owner-workloop-slots.txt
+
+python3 scripts/awdl-abi/scan_skywalk_direct_calls.py \\
+  --families IOSkywalk,IOUserNetwork,IOEthernet \\
+  --skip-functions 540 --max-functions 180 --max-lines 450 \\
+  --virtual-offsets 0x140,0x148 \\
+  --max-virtual-hits 80 \\
+  --out /tmp/awdl-workloop-slots-540-720.txt
+
+cat /tmp/awdl-workloop-slots-540-720.txt
+```
+
+The first pass focuses on concrete
+QueueSet/LogicalLink/interface/packet
+queue owners and requests **precisely**
+the WorkLoop add/remove slots as well as
+the TX queue's `packetSubmission` slot.
+The second examines the next general
+ranked slice. Both outputs should be
+short summaries, not raw KC code. If a
+candidate appears, trace the few specific
+caller instructions and receiver provenance
+before labeling it a WorkLoop attach/detach
+call. No-hit is *not* permission to destroy
+the borrowed `TxCallbackContext` or
+enable AWDL.
+
+No kext, EFI, runtime driver or experimental
+AWDL registration/datapath modifications.

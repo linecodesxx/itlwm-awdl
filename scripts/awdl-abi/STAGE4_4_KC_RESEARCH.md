@@ -922,3 +922,81 @@ call sites and external TX packet producers.
 Do not redistribute raw proprietary KC output or
 enable the AWDL runtime. Production kext and EFI
 remain untouched.
+
+
+
+## Queue allocation, free and owner-side entrypoint inventory (2026-11-11)
+
+The developer supplied local Tahoe 25G332 output for
+`IOSkywalkTxSubmissionQueue::withPool` overloads,
+`IOSkywalkTxSubmissionQueue::free`,
+`IOSkywalkPacketQueue::free`, and 171
+symbol-inventory matches for
+`IOSkywalkNetworkInterface` / `IOSkywalkQueueSet`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 22.
+
+- The full TX `withPool` allocator constructs a
+  `0x168`-byte queue, invokes virtual `initWithPool`
+  at object-vptr `+0x2a8`, and `release()`s the
+  object if that initialization fails.
+  Smaller overloads forward arguments/flags into
+  this allocator; the `IOSkywalkPacket**` variant
+  forces option bit `0x8`.
+- TX `free()` destroys/frees its packet-table and
+  stats/ABFS allocations before tail-calling base
+  `IOSkywalkPacketQueue::free()`, which releases
+  the pool reference. These bodies show **no
+  explicit** packet purge, queue finalize, workloop
+  detach or callback drain. The inherited
+  `IOEventSource::free` and owner sequence require
+  separate validation before asserting total absence.
+- Newly found owner-side candidates:
+  `IOSkywalkQueueSet::{initWithQueues,initialize,
+  setEnable,finalize,free}` and
+  `IOSkywalkNetworkInterface::{registerNetworkInterface,
+  deregisterNetworkInterface,stop,free}`.
+  None is yet proven to call `removeEventSource`.
+- The 171-match inventory is not an exact
+  member count. The original class filter matched
+  types mentioned inside unrelated function arguments
+  (such as `AppleEthernetRL::getTSOOptions`).
+  The read-only collector has now been fixed to
+  require that the **demangled qualified name starts
+  with the selected class**, keeping methods
+  correctly assigned.
+
+### Next two bounded read-only collections (both include cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkQueueSet \\
+  --methods initWithQueues,initialize,setEnable,finalize \\
+  --max-functions 6 --max-lines 550 \\
+  --out /tmp/awdl-skywalk-queueset-lifecycle.txt
+
+cat /tmp/awdl-skywalk-queueset-lifecycle.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkNetworkInterface \\
+  --methods registerNetworkInterface,deregisterNetworkInterface \\
+  --max-functions 8 --max-lines 500 \\
+  --out /tmp/awdl-skywalk-interface-registration.txt
+
+cat /tmp/awdl-skywalk-interface-registration.txt
+```
+
+The second output may be longer because the register
+method has multiple overloads and compiler-generated
+allocation-view symbols. They are local research
+evidence, **not** files to commit to a public GitHub
+repository. The next decision will be based on
+whether either owner path calls the workloop's
+add/remove entrypoints and which callbacks can still
+be initiated after that operation.
+
+Runtime AWDL registration and datapath remain
+disabled, with no kext or EFI modifications.

@@ -1363,10 +1363,10 @@ section 27.
   virtual with `false`. It may report the
   link-down status and clears a private
   state flag at `private+0x3c`.
-- **The vptr `+0x930` method name is unknown.**
-  It is a plausible path to queue-set cascade
-  but this must not be asserted without
-  local vtable verification and its method body.
+- **Updated by exact KC vtable evidence:** `+0x930`
+  is `IOSkywalkNetworkInterface::setInterfaceEnable(bool)`
+  at `0xffffff8002b10558`. Its body must still
+  be inspected before claiming a queue-set cascade.
 - New superclass candidates:
   `IOSkywalkInterface::registerInterfaceWithQueues`
   at `0xffffff8002b00d0c`,
@@ -1380,8 +1380,9 @@ section 27.
   `__ZTV+0x5d8`, object-vptr `+0x5c8`.
   The symbol inventory contains no
   `IOSkywalkInterface::stop` override;
-  this target may be inherited and must
-  be resolved, not assumed.
+  subsequent local vtable inspection confirms
+  this entry is `IOService::stop(IOService*)`
+  at `0xffffff8000a94e80`.
 - No proven workloop detach, direct-TX callback
   drain or borrowed-`refCon` no-future-entry
   barrier follows merely from `interface+0xd8`
@@ -1420,3 +1421,95 @@ not be treated as proof of no detach anywhere.
 Do not commit local proprietary KC output.
 Neither runtime feature flag is enabled;
 do not install a research kext or alter EFI.
+
+
+
+## Queue-array register/deregister and concrete setInterfaceEnable identity (2026-11-11)
+
+The developer supplied the local Tahoe 25G332 KC
+vtable scan and full, bounded disassembly of
+`IOSkywalkInterface::{registerInterfaceWithQueues,
+deregisterInterfaceWithQueues,free}`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md)
+section 28 for the detailed flow.
+
+- `IOSkywalkNetworkInterface` object-vptr
+  `+0x930` maps to
+  **`IOSkywalkNetworkInterface::setInterfaceEnable(bool)`**
+  at `0xffffff8002b10558`.
+- `IOSkywalkInterface` object-vptr `+0x5c8`
+  maps to inherited **`IOService::stop`**
+  at `0xffffff8000a94e80`;
+  `IOSkywalkNetworkInterface +0x5c8` maps
+  to its own overriding `stop`.
+- `IOSkywalkInterface::registerInterfaceWithQueues`
+  requires a non-null array with `count >= 2`
+  and at least one pool. It constructs a queue
+  `OSArray`, atomically publishes it at
+  `interface+0x90`, associates each queue
+  with this interface via `setInterface`,
+  and retains pool references at
+  `+0x98/+0xa0`.
+- `IOSkywalkInterface::deregisterInterfaceWithQueues`
+  atomically unpublishes the `OSArray`
+  and releases the array/pool references,
+  without an explicit direct queue disable,
+  `setInterface(nullptr)`, workloop
+  `removeEventSource` or TX callback drain.
+  This is **a local method observation**, not
+  proof that other owner paths are absent.
+- `IOSkywalkInterface::free` invokes that
+  deregistration, then tears down an auxiliary
+  object/lock allocation and delegates
+  to superclass free.
+- The `IOSkywalkInterface` queue-array API
+  is not yet proven to be the same route as
+  `IOSkywalkNetworkInterface::registerNetworkInterface`
+  with QueueSet/LogicalLink. Do not merge
+  ownership models without tracing callers.
+
+**Safety status:** no global no-future-callback
+barrier has yet been established for the
+borrowed `SkywalkBackend::txCallbackContext_`.
+An `OSArray::release` and workloop-list
+detach are distinct operations. No experimental
+AWDL registration or datapath should run.
+
+### Next bounded local method inspection (both commands end in cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkNetworkInterface,IOSkywalkPacketQueue \\
+  --methods setInterfaceEnable,setInterface \\
+  --max-functions 4 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-interface-enable-association.txt
+
+cat /tmp/awdl-skywalk-interface-enable-association.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkInterface \\
+  --methods willTerminate,didTerminate,handleClose \\
+  --max-functions 5 --max-lines 400 \\
+  --out /tmp/awdl-skywalk-interface-termination.txt
+
+cat /tmp/awdl-skywalk-interface-termination.txt
+```
+
+The first identifies whether `setInterfaceEnable`
+cascades to LogicalLink/QueueSet and whether
+`setInterface` owns or merely stores the
+association. The second checks higher-level
+termination hooks for queue teardown
+ordering and event-source removal.
+If neither contains a direct remove call,
+an owner/caller-oriented vtable and
+cross-reference investigation will still
+be necessary.
+
+Only read local KC disassembly; do not
+publish proprietary output, install kexts,
+modify EFI, or enable the experimental AWDL
+code paths.

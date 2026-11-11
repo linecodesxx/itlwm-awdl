@@ -1079,3 +1079,86 @@ to destroy on a merely disabled queue.
 
 All experiments remain read-only; AWDL runtime
 registration and packet datapath stay disabled.
+
+
+
+## QueueSet and LogicalLink cleanup method bodies (2026-11-11)
+
+The developer supplied local 25G332 KC output for
+`IOSkywalkQueueSet::{initialize,setEnable,finalize,free}`
+and `IOSkywalkLogicalLink::{setInterface,free}`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md)
+section 24 for detailed control-flow and ownership evidence.
+
+**Confirmed:**
+
+- `QueueSet::setEnable(true/false)` walks all
+  queues and calls object-vptr `+0x150/+0x158`
+  respectively, i.e. queue enable/disable.
+  It does **not** remove their WorkLoop event
+  sources in this body.
+- `QueueSet::initialize` calls a self virtual
+  `+0x128` (not yet mapped), then initializes
+  categorized queues at `QueueSet+0x28` and
+  `+0x30`, and calls `QueueSet::finalize`
+  if a later stage fails.
+- `QueueSet::finalize` calls queue virtual
+  `+0x1c0` (finalize) for exactly those two
+  categorized queue arrays; it ignores per-queue
+  status and clears `+0x48/+0x50`.
+- `QueueSet::free` removes each queue's
+  QueueSet backpointer, releases every retained
+  queue reference and frees the arrays.
+  It does not explicitly invoke finalize,
+  disable, or WorkLoop detach in the shown body.
+- `LogicalLink::setInterface(interface)`
+  checks queue pointers into or out of their
+  packet-buffer pools and sets owner registry
+  IDs. **Pool registration is not WorkLoop
+  event-source attachment.**
+- `LogicalLink::free` calls **QueueSet vptr
+  `+0x118` with null** prior to
+  `setLogicalLink(nullptr)` and `release()`.
+  This virtual method must be mapped before
+  assigning teardown semantics; no direct
+  `removeEventSource` was observed.
+
+This fills in the parent/child reference
+releases but still does **not** show a complete
+no-future-callback barrier for the borrowed
+`TxCallbackContext`. A Gate close or
+`setEnable(false)` alone cannot establish
+its safe destruction.
+
+### Next two read-only checks, with cat for each output
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOSkywalkQueueSet,IOSkywalkLogicalLink,IOSkywalkTxSubmissionQueue,IOSkywalkPacketQueue \\
+  --offsets 0x118,0x128,0x150,0x158,0x1b8,0x1c0,0x1e8,0x218 \\
+  > /tmp/awdl-skywalk-parent-vptr.txt
+
+cat /tmp/awdl-skywalk-parent-vptr.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOEventSource \\
+  --methods free,setWorkLoop \\
+  --max-functions 4 --max-lines 330 \\
+  --out /tmp/awdl-event-source-free.txt
+
+cat /tmp/awdl-event-source-free.txt
+```
+
+The vtable check resolves the unknown
+`QueueSet+0x118` and `+0x128` methods,
+and packet-pool getter slot
+`queue+0x1e8`. The second check inspects
+the inherited `IOEventSource::free` path,
+which can affect whether event-source removal
+is guaranteed before the subclass's memory
+is reclaimed. Inspect both without live
+registration, kext loading, or EFI changes.
+Do not publish raw KC assembly in the repo.

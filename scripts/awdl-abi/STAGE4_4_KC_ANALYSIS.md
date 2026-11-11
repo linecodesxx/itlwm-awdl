@@ -1326,3 +1326,150 @@ lifecycle can ultimately close this gap.
 
 **No modification to the kext source, runtime flags,
 EFI, or native interface registration.**
+
+
+
+## 21. TX initialize, enable and disable lifecycle in 25G332 (2026-11-11)
+
+**Evidence:** developer-provided local file
+`awdl-skywalk-tx-attach-lifecycle.txt` from
+`/System/Library/KernelCollections/BootKernelExtensions.kc`
+with method bodies for
+`IOSkywalkTxSubmissionQueue::{initialize,enable,disable}`
+and `IOSkywalkPacketQueue::{initialize,disable}`. The report
+describes their behavior without redistributing proprietary
+disassembly.
+
+### 21.1 Base initialize confirms what queue+0xbc counts
+
+`IOSkywalkPacketQueue::initialize(void*)` at
+`0xffffff8002b0dcce`:
+
+- Builds queue metadata/id into `queue+0x98` using
+  `IOSkywalkQueueSet::getQueueSetId()`, plus stored
+  queue fields; copies a name derived from
+  `IOSkywalkNetworkInterface` when available.
+- Invokes `pool->checkInPacketQueue(queue)`, the
+  pool-side `OSSet::setObject` registration described
+  earlier.
+- **Increments `queue+0xbc`**. When the updated
+  count equals 1, sets `queue+0xcc=1` and returns
+  success (0). If greater than 1, returns
+  `0xe00002d5`.
+
+The matching base `finalize()` decrements the same
+field and may call `checkOutPacketQueue`; hence
+`+0xbc` is a **queue initialize/finalize balance
+counter**, not evidence of in-flight callbacks.
+A nonzero `+0xbc` value alone cannot tell us
+whether any callback is currently executing.
+
+This also explains why the specialized TX
+`initialize()` handles `0xe00002d5` by invoking
+its `finalize()`: that error can occur on repeated
+initialization, and a balancing cleanup is attempted.
+Exact callback safety of that recovery path remains
+unproven.
+
+### 21.2 Specialized TX initialize controls bookkeeping, not attach
+
+`IOSkywalkTxSubmissionQueue::initialize(void*)` at
+`0xffffff8002b11e8e`:
+
+1. Calls `IOEventSource::closeGate()` only when
+   `queue+0x30` (associated workloop pointer) is
+   non-null.
+2. Calls base `IOSkywalkPacketQueue::initialize()`
+   through raw base `__ZTV+0x1c8`, corresponding to
+   base object-vptr `+0x1b8`.
+3. If base init returns 0, writes the argument
+   into `queue+0xe0` and zeroes the fields
+   `+0x13c`, `+0x14c`, `+0x148`.
+4. If base init returns `0xe00002d5`,
+   calls the specialized queue's virtual
+   `finalize()` via object-vptr `+0x1c0`.
+5. Reopens the event gate when associated with
+   a workloop and returns the base init's
+   status.
+
+**No direct `IOWorkLoop::addEventSource()` or
+`removeEventSource()` call appears** in this
+specialized body or the reviewed base body.
+Their absence here does not prove that an owner
+cannot register/deregister the queue elsewhere.
+Also the `queue+0xe0` field stores an opaque
+caller-supplied pointer; ownership and lifetime
+need inspection of its users.
+
+### 21.3 enable and disable are not detach operations
+
+`IOSkywalkTxSubmissionQueue::enable()` at
+`0xffffff8002b11c76`:
+
+- Calls `IOEventSource::closeGate()`,
+  tests current enable bit at `queue+0x28`,
+  and calls **base queue enable** via raw
+  `__ZTV20IOSkywalkPacketQueue+0x160`
+  (object-vptr `+0x150`) if it was disabled.
+- Depending on the queue's interface and flags,
+  invokes virtual `packetSubmission(false)`
+  (`+0x1d8`) or `sendNotification(0)`
+  (`+0x1e0`) and then reopens the gate.
+- Thus `enable()` can start TX packet processing.
+  It is not merely a state setter, and it does not
+  itself demonstrate an event-source attachment call.
+
+`IOSkywalkTxSubmissionQueue::disable()` at
+`0xffffff8002b11cd6`:
+
+- Closes the event gate if `queue+0x30`
+  is non-null.
+- Calls **base queue disable** through raw
+  `__ZTV20IOSkywalkPacketQueue+0x168`
+  (object-vptr `+0x158`).
+- Reopens the gate if it was associated.
+
+`IOSkywalkPacketQueue::disable()` at
+`0xffffff8002b0de34` first calls
+`resetABFS()` if `queue+0x68` is non-null,
+then tail-calls the base `IOEventSource::disable`
+at its raw vtable slot. It does **not** invoke
+`removeEventSource`, does **not** null the
+event source's workloop pointer, and does not
+wait for externally initiated TX submissions.
+
+This establishes that the current hypothetical
+backend's `q->disable(); q->release();`
+sequence **must not be treated as sufficient
+evidence of a no-future-`refCon` entry barrier**.
+Since all Stage 4 runtime allocation gates remain
+off, no live unsafe behavior is inferred.
+
+### 21.4 Necessary owner-side research
+
+1. Resolve the base `IOSkywalkPacketQueue::enable`
+   object-vptr slot `+0x150` and inspect its
+   implementation to confirm any additional
+   lifecycle side effects.
+2. Identify **actual caller(s)** of
+   `IOWorkLoop::addEventSource(txQueue)`,
+   `IOWorkLoop::removeEventSource(txQueue)`,
+   `txQueue->initialize`, and
+   `txQueue->packetSubmission` in the
+   surrounding Skywalk/network-interface owner.
+3. Trace the queue's `free()` and
+   `setWorkLoop(nullptr)` paths, ensuring
+   `disable() -> detach -> drain -> release`
+   or another equally proven ordering.
+4. Separately prove direct TX producer
+   callbacks cannot be initiated after the
+   successful workloop detach, and all
+   in-flight borrowed `refCon` users have exited.
+
+**Verdict:** the WorkLoop-list detach mechanism
+is now well evidenced; the *owner-side decision
+to detach before destruction* and the
+*external TX submission path* remain the
+blocking lifecycle gaps. Keep
+`ITLWM_AWDL_DATAPATH_LIVE=0` and
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`.

@@ -2,11 +2,17 @@
 //  AirportItlwmAWDLInterface.hpp
 //  AirportItlwm-Tahoe
 //
-//  Stage 2: concrete IO80211AWDLProtocol subclass for ABI bring-up only.
+//  Stage 2/3: concrete IO80211AWDLProtocol subclass plus a fail-closed
+//  lifecycle.
 //
 //  This class is NOT instantiated, attached, registered or started. It exists
 //  so the 25G332 vtable can be reproduced and linked, and so the 63 AWDL
 //  method signatures can be checked against the Kernel Collection.
+//
+//  Stage 3 adds non-virtual lifecycle methods that track owner/MAC/state in a
+//  module-local side table. They never call the Apple base init, allocate a
+//  packet pool or queue, or register an interface; startLifecycle() always
+//  fails closed.
 //
 //  Rules that keep the ABI intact:
 //    - derive only from the experimental IO80211AWDLProtocol;
@@ -30,7 +36,20 @@
 
 #include "AirportItlwmAWDLExperimental.hpp"
 
+/*
+ * Stage 3 registration gate. It is deliberately closed: the lifecycle below
+ * prepares and validates a RegistrationInfo buffer, then fails closed before
+ * IOSkywalkEthernetInterface::registerEthernetInterface() is reached. Flipping
+ * this to 1 is not sufficient to register an interface; see the conditions in
+ * scripts/awdl-abi/STAGE3_BUILD_REPORT.md.
+ */
+#ifndef ITLWM_AWDL_REGISTRATION_ENABLED
+#define ITLWM_AWDL_REGISTRATION_ENABLED 0
+#endif
+
 #if ITLWM_AWDL_EXPERIMENTAL
+
+#include <stddef.h>
 
 #include <Airport/experimental/IO80211AWDLProtocolABI_25G332.h>
 
@@ -38,6 +57,47 @@ class AirportItlwmAWDLInterface : public IO80211AWDLProtocol {
     OSDeclareDefaultStructors(AirportItlwmAWDLInterface)
 
 public:
+    /*
+     * Stage 3 lifecycle. These are deliberately NON-VIRTUAL:
+     *   - the class keeps the verified 571-entry vtable and 0x130 size;
+     *   - no IOService / IO80211VirtualInterface virtual is overridden, so
+     *     the Stage 2 slot map (488, 505..567) is unchanged;
+     *   - the methods only track ownership and validate a local
+     *     RegistrationInfo. They never call the Apple base init, allocate a
+     *     packet pool, create a queue, or register an interface.
+     *
+     * initLifecycle() records the owner and MAC. It is idempotent only in the
+     * sense that a second call on an already-initialized object fails; the
+     * owner must call teardownLifecycle() first.
+     *
+     * startLifecycle() is fail-closed in Stage 3: it validates the state,
+     * builds the 0x130-byte RegistrationInfo locally, checks the KC-derived
+     * invariants, then returns kIOReturnUnsupported and rolls back to
+     * Initialized. No partial state is left behind.
+     *
+     * stopLifecycle() is idempotent. Nested successful starts would be
+     * reference-counted; teardownLifecycle() is safe to call twice and frees
+     * the side-table record exactly once.
+     *
+     * The owner pointer is weak: the controller owns the interface and must
+     * outlive it. The interface never retains the controller, avoiding a
+     * retain cycle.
+     */
+    bool initLifecycle(IO80211Controller *owner, const ether_addr &mac);
+    IOReturn startLifecycle();
+    IOReturn stopLifecycle();
+    void teardownLifecycle();
+    bool isLifecycleInitialized() const;
+    bool isLifecycleRunning() const;
+
+    /*
+     * Fill a caller-provided buffer with the 0x130-byte Ethernet
+     * RegistrationInfo decoded from the 25G332 KC. Returns false when the
+     * buffer is too small, when the object has no lifecycle record, or when
+     * the MAC is not a valid unicast address. The buffer is never passed to
+     * the registration API in Stage 3.
+     */
+    bool buildRegistrationInfo(void *buffer, size_t size) const;
     /*
      * Slot 488, pure in the KC (___cxa_pure_virtual). The experimental VIF
      * header declares uintptr_t, so the override must use the same type.

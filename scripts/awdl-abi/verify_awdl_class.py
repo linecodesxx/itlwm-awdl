@@ -186,6 +186,13 @@ def defined_symbols(obj):
                           r.stdout, re.M))
 
 
+def undefined_symbols(obj):
+    r = run(["nm", "-u", obj])
+    if r.returncode != 0:
+        raise SystemExit("nm -u failed for %s:\n%s" % (obj, r.stdout))
+    return set(r.stdout.split())
+
+
 def kext_symbols(kext):
     exe = os.path.join(kext, "Contents", "MacOS", "AirportItlwm")
     r = run(["nm", "-m", exe])
@@ -271,6 +278,41 @@ def main():
           "metaclass gMetaClass is defined")
     check("__ZTV25" + CLS in all_syms,
           "vtable symbol __ZTV25%s is defined" % CLS)
+
+    # ---- Stage 3 lifecycle -------------------------------------------------
+    print("\n[stage 3 lifecycle]")
+    lifecycle_methods = (
+        "initLifecycle",
+        "startLifecycle",
+        "stopLifecycle",
+        "teardownLifecycle",
+        "buildRegistrationInfo",
+        "isLifecycleInitialized",
+        "isLifecycleRunning",
+    )
+    missing_lifecycle = [m for m in lifecycle_methods
+                         if not any(m in s for s in all_syms)]
+    check(not missing_lifecycle,
+          "all lifecycle methods are defined (missing %s)"
+          % (missing_lifecycle or "none"))
+
+    # The inherited vtable still references
+    # IOSkywalkNetworkInterface::registerNetworkInterfaceWithLogicalLink.
+    # These non-virtual registration/pool entry points must not be referenced
+    # by the Stage 3 object at all.
+    undef = undefined_symbols(obj)
+    forbidden_prefixes = (
+        "__ZN26IOSkywalkEthernetInterface25registerEthernetInterface",
+        "__ZN26IOSkywalkEthernetInterface20initRegistrationInfo",
+        "__ZN26IOSkywalkEthernetInterface27deregisterEthernetInterface",
+        "__ZN25IOSkywalkPacketBufferPool",
+        "__ZN17IOSkywalkQueueSet",
+    )
+    forbidden = sorted(s for s in undef
+                       if any(s.startswith(p) for p in forbidden_prefixes))
+    check(not forbidden,
+          "no direct registration / packet-pool references (got %s)"
+          % (forbidden or "none"))
 
     # ---- optional built kexts ---------------------------------------------
     if args.kext:

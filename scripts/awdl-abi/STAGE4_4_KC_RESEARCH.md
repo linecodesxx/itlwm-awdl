@@ -102,3 +102,40 @@ availability only, NOT any queue-drain guarantee, callback lifetime,
 completion/drop ownership or correct runtime behavior. The full local
 disassembly is still required for control-flow review. All production
 runtime gates remain off.
+
+## First control-flow interpretation (from the local 13-function dump)
+
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md) for the
+method-by-method analysis. Key findings:
+
+- TX `legacyDequeue` consumes the callback return as a **ring advancement
+  count**; returning zero stalls dequeue, and a returned count greater than
+  offered is not clamped within the shown path.
+- TX completion array overload calls `completePackets`, which invokes a
+  batch virtual at `[*(queue+0x50)]+0x148`. The linked-list overload instead
+  uses `+0x140`. Targets and return semantics still require vtable mapping.
+- RX array path selects `enqueuePacketsForNetworking` or
+  `enqueuePacketsForKPipe`; the linked-list path calls
+  `_kern_netif_queue_rx_enqueue` and does not inspect its return.
+- TX/RX pointer-array `enqueuePackets` check `count < *(queue+0xac)`;
+  the meaning of the field is not yet independently verified.
+- Specialized `disable()` functions **reopen the event-source gate** after
+  base disabling. This cannot by itself prove no-future-callback entry,
+  draining or safe release of `refCon`.
+
+### Next read-only collection
+
+On the current research branch:
+
+```bash
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \
+  --methods free,enqueuePacketsForNetworking,enqueuePacketsForKPipe,resetABFS \
+  --max-functions 15 --max-lines 450 \
+  --out /tmp/awdl-skywalk-remaining-evidence.txt
+```
+
+These scripts are read-only. The vtable mapping will help identify the
+batch/single packet return operations. Share results privately for review;
+do not commit proprietary disassembly to GitHub. Kernel behavior remains
+unproven and all AWDL runtime gates stay off.

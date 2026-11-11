@@ -1339,3 +1339,84 @@ or hand off to other owner objects. If not, another
 reverse-caller investigation will be required.
 Do not commit raw KC disassembly or make any
 kext/EFI/runtime changes.
+
+
+
+## IOSkywalkInterface queue API and network virtual enable path (2026-11-11)
+
+The developer posted the 38-symbol method inventory for
+`IOSkywalkInterface` and the local Tahoe 25G332
+`IOSkywalkNetworkInterface::{enable,disable}`
+function bodies. See
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md)
+section 27.
+
+**Confirmed by local KC:**
+
+- `NetworkInterface::enable(unsigned)` calls its
+  **dynamic vptr `+0x930`** with `true`; stores
+  whether that returned success as `interface+0xd8`.
+- `NetworkInterface::disable(unsigned)` uses an
+  atomic `cmpxchg` transition of `+0xd8`
+  from 1 to 0; only on that successful
+  transition does it call the same `+0x930`
+  virtual with `false`. It may report the
+  link-down status and clears a private
+  state flag at `private+0x3c`.
+- **The vptr `+0x930` method name is unknown.**
+  It is a plausible path to queue-set cascade
+  but this must not be asserted without
+  local vtable verification and its method body.
+- New superclass candidates:
+  `IOSkywalkInterface::registerInterfaceWithQueues`
+  at `0xffffff8002b00d0c`,
+  `deregisterInterfaceWithQueues` at
+  `0xffffff8002b00b9c`,
+  and `free` at `0xffffff8002b00b14`.
+  Their behavior has **not** yet been inspected.
+- Important earlier naming correction:
+  `NetworkInterface::stop` tail-calls
+  the raw `IOSkywalkInterface` base table
+  `__ZTV+0x5d8`, object-vptr `+0x5c8`.
+  The symbol inventory contains no
+  `IOSkywalkInterface::stop` override;
+  this target may be inherited and must
+  be resolved, not assumed.
+- No proven workloop detach, direct-TX callback
+  drain or borrowed-`refCon` no-future-entry
+  barrier follows merely from `interface+0xd8`
+  state transitions.
+
+### Next precise, read-only local KC checks (each ends in cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOSkywalkNetworkInterface,IOSkywalkInterface \\
+  --offsets 0x930,0x5c8 \\
+  > /tmp/awdl-network-virtuals.txt
+
+cat /tmp/awdl-network-virtuals.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkInterface \\
+  --methods registerInterfaceWithQueues,deregisterInterfaceWithQueues,free \\
+  --max-functions 4 --max-lines 550 \\
+  --out /tmp/awdl-interface-queue-api.txt
+
+cat /tmp/awdl-interface-queue-api.txt
+```
+
+The first command identifies the vtable targets
+on the **actual KC**. The second inspects the
+specific superclass queue API. A call to
+`removeEventSource` here would be positive
+evidence; its absence would redirect research
+to the caller / concrete subclass and must
+not be treated as proof of no detach anywhere.
+
+Do not commit local proprietary KC output.
+Neither runtime feature flag is enabled;
+do not install a research kext or alter EFI.

@@ -714,3 +714,67 @@ list and proceed with a targeted vtable/function-reference
 investigation instead of assuming its behavior. No
 live AWDL, EFI changes or kext installation is permitted
 by this evidence.
+
+
+
+## Exact 25G332 IOWorkLoop maintenance removal verified (2026-11-11)
+
+The developer uploaded a full **local KC** extraction of
+`IOWorkLoop::_maintRequest`, `IOWorkLoop::init` and
+`IOWorkLoop::runEventSources`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 19 for specific control-flow findings.
+
+This closes the gap between our **public-XNU architectural guess**
+and the exact locally inspected Tahoe 25G332 implementation:
+
+- `removeEventSource` calls the internal command gate.
+  The `_maintRequest` remove operation (1) traverses
+  active/passive source chains, unlinks the matching
+  source, calls `setWorkLoop(nullptr)` and
+  `setNext(nullptr)`, releases a workloop-held
+  source reference, and sets a rescan flag.
+- `runEventSources` traverses the same source
+  lists while holding the workloop gate, invoking
+  source `checkForWork` and `getNext`.
+  A changed-list flag causes traversal to restart.
+  **This provides evidence that removal and
+  WorkLoop-driven `checkForWork` calls are serialized.**
+- `IOWorkLoop::init` creates the internal command
+  gate stored at `workloop+0x20`; the action callback
+  comes from the workloop's own vptr `+0x118`.
+  Its exact identity needs vtable confirmation.
+- A remove request may return 0 on an already
+  unattached source. Other cases can return
+  `0xe00002c2` when the source is not located.
+  The owner must track attachment state.
+
+**Remaining danger:** queue callbacks may originate
+from direct TX packetSubmission callers outside
+`runEventSources`, and there is still no evidence
+that an experimental backend will perform this
+workloop removal before destroying its embedded
+`TxCallbackContext`. The trampoline uses `refCon`
+before checking its `CallbackGate`. Do not enable
+any live AWDL path.
+
+### Next read-only mapping (including cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOWorkLoop,IOEventSource,IOSkywalkTxSubmissionQueue,IOCommandGate \\
+  --offsets 0x118,0x120,0x128,0x130,0x138,0x168,0x1b8 \\
+  > /tmp/awdl-workloop-maint-vptr.txt
+
+cat /tmp/awdl-workloop-maint-vptr.txt
+```
+
+Next investigation after mapping: find the **specific
+owner-side attach/remove call sites** and non-workloop
+packetSubmission callers, rather than inferring an
+all-callback drain merely from the generic workloop
+mechanism. All flags remain disabled; no kext or EFI
+changes.

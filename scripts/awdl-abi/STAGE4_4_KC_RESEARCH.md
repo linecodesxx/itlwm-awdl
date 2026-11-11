@@ -332,3 +332,50 @@ Both uploaded evidence files have been reviewed: [STAGE4_4_PACKET_FINALIZE_REVIE
 The critical outstanding safety issue is proving callback quiescence before freeing the TX submission queue's `refCon`. No `finalize()` body proves that. Additionally, TX completion's `finalize()` masks base code `0xe00002d5` as success while skipping some state cleanup. The observed native TX pool-return calls are `_kern_pbufpool_free` and `_kern_pbufpool_free_batch`, after wrapper disposal. RX's native network handoff is separate.
 
 Next evidence: `IOSkywalkPacketTable::flushAllPackets`, `IOSkywalkPacketBufferPool::completePreparedPacket`/`checkOutPacketQueue`, and vptr offsets `IOSkywalkPacket::0x1a0`, `IOSkywalkPacketBuffer::0x148`, `TxSubmissionQueue::0x2a0`.
+
+
+## Checkout, flush and buffer disposal reviewed (2026-11-11)
+
+The developer pasted the locally disassembled bodies of
+`IOSkywalkPacketBufferPool::checkOutPacketQueue`,
+`IOSkywalkPacketTable::flushAllPackets`, and
+`IOSkywalkPacketBuffer::disposePacketBuffer`. See
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md), section 12.
+
+- `checkOutPacketQueue` takes a recursive pool lock and updates
+  queue-related collections; pool checkout is **not** a proven workloop
+  callback-quiescence guarantee.
+- `flushAllPackets` cancels **per-packet** completion callbacks,
+  passes pending packet-wrapper segments to pool
+  `deallocatePackets`, and advances the table read index.
+  The pool deallocation call returns native packets via
+  `_kern_pbufpool_free_batch`.
+- `disposePacketBuffer` zeroes wrapper fields; it does not directly
+  return a packet to a native pool.
+- None of these functions proves that the TX submission callback's
+  `refCon` cannot be used after the owning backend is released.
+
+The read-only collector now recognizes the named
+`cancelCompletionCallback`, `setCompletionCallback`, and
+`checkInPacketQueue` methods. Run the next local checks (with `cat`
+to inspect the saved output):
+
+```sh
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOSkywalkPacketQueue,IOSkywalkTxSubmissionQueue,IOSkywalkPacket,IOSkywalkPacketBuffer \\
+  --offsets 0x18,0x148,0x1a0,0x2a0
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --methods cancelCompletionCallback,setCompletionCallback,checkInPacketQueue \\
+  --max-functions 15 --max-lines 300 \\
+  --out /tmp/awdl-skywalk-callback-lifetime.txt
+
+cat /tmp/awdl-skywalk-callback-lifetime.txt
+```
+
+If the collector lists fewer than three methods, that is not itself
+a failure: only symbols actually present in this KC will appear.
+Do not commit raw proprietary disassembly, and do not enable AWDL.

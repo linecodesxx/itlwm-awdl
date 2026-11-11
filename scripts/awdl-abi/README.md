@@ -502,3 +502,16 @@ Do not enable `ITLWM_AWDL_DATAPATH_LIVE` or AWDL registration.
 See [STAGE4_2_SAFETY_REVIEW.md](STAGE4_2_SAFETY_REVIEW.md) for test commands,
 open risks and the implementation boundary. This branch needs new local
 macOS Tahoe builds and checks before it can be considered validated.
+
+
+## Stage 4.3 — packet ownership simulation (host-only)
+
+An isolated C++14 header, `AirportItlwm/AirportItlwmAWDLPacketFlow.hpp`,
+models atomic batch claims, TX/RX packet ownership, exactly-once finalize,
+explicit return acknowledgement and generation-stamped tokens. This is a
+**test model**, not the actual Skywalk TX/RX implementation; no driver
+source includes it or changes any runtime gate.
+
+`verify_datapath.py` now runs `test_packet_flow.cpp` alongside the
+Stage 4.2 tests. Details and the remaining 25G332 kernel-behavior questions
+are in [STAGE4_3_PACKET_FLOW_REVIEW.md](STAGE4_3_PACKET_FLOW_REVIEW.md).

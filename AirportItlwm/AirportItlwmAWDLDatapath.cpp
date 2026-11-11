@@ -78,6 +78,7 @@ extern "C" IOSkywalkRxCompletionQueue *awdlRxCompletionWithPool(
 struct TxCallbackContext {
     OSObject *target; /* weak: the owner must outlive all queues */
     itlwm_awdl_datapath::TxAction action;
+    itlwm_awdl_datapath::CallbackGate gate; /* never armed in Stage 4.2 */
 };
 
 /*
@@ -91,6 +92,9 @@ uint32_t txSubmissionAction(OSObject *target, IOSkywalkTxSubmissionQueue *,
 {
     const TxCallbackContext *ctx = static_cast<const TxCallbackContext *>(refCon);
     if (ctx == nullptr || ctx->target != target)
+        return 0;
+    itlwm_awdl_datapath::CallbackLease admission(ctx->gate);
+    if (!admission.acquired())
         return 0;
     return itlwm_awdl_datapath::dispatchTxAction(
         ctx->action, reinterpret_cast<void *const *>(packets), count);
@@ -152,6 +156,17 @@ class SkywalkBackend : public itlwm_awdl_datapath::Backend {
 public:
     explicit SkywalkBackend(OSObject *owner)
         : owner_(owner), txCallbackContext_{owner, {nullptr, nullptr}} {}
+    
+    ~SkywalkBackend() override
+    {
+        /*
+         * The gate is never armed in Stage 4.2. Closing it here is only an
+         * extra defensive guard, NOT proof of Skywalk queue quiescence.
+         * Future live code must drain and unregister queue callbacks before
+         * allowing this destructor to execute.
+         */
+        txCallbackContext_.gate.close();
+    }
 
     void *createPool(const char *name,
                      const itlwm_awdl_datapath::PoolOptions &options) override
@@ -177,8 +192,9 @@ public:
     {
         /*
          * The queue's refCon points into this backend. A future live path
-         * MUST serialize queue teardown and drain callbacks before deleting
-         * the backend. Stage 4.1 leaves all runtime gates closed.
+         * MUST serialize queue teardown, close the gate, wait for admitted
+         * callbacks and prove no further callback entry is possible before
+         * deleting the backend. Stage 4.2 never arms the callback gate.
          */
         txCallbackContext_.action = action;
 #if ITLWM_AWDL_DATAPATH_LIVE

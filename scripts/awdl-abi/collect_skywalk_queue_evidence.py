@@ -62,6 +62,9 @@ DEFAULT_METHODS = (
     "checkOutPacketQueue",
     "flushAllPackets",
     "disposePacketBuffer",
+    "cancelCompletionCallback",
+    "setCompletionCallback",
+    "checkInPacketQueue",
 )
 
 

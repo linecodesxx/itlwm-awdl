@@ -149,7 +149,7 @@ def test_host_manager(outdir):
     print("[host tests]")
     binary = os.path.join(outdir, "test_datapath")
     result = run(["xcrun", "clang++", "-std=c++14", "-Wall", "-Wextra",
-                  "-Werror", "-I", os.path.join(ROOT, "AirportItlwm"),
+                  "-Werror", "-pthread", "-I", os.path.join(ROOT, "AirportItlwm"),
                   TEST_CPP, "-o", binary])
     check(result.returncode == 0, "test_datapath.cpp builds with -Werror")
     if result.returncode != 0:

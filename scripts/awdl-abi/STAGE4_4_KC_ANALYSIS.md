@@ -224,7 +224,7 @@ The subsequent read-only collector run found 7 symbol entries with 6 nonempty me
 - `IOSkywalkPacketBufferPool::releaseAllMemorySegments()` — 19 lines
 
 The seventh entry is a kalloc type-view metadata symbol with zero instructions.
-**Only the console summary, not the contents of `/tmp/awdl-skywalk-packet-lifetime.txt`, has been received.** No conclusions about these methods' internal error handling, resource release ordering or success paths are warranted yet.
+**Update:** the actual `awdl-skywalk-packet-lifetime.txt` was subsequently uploaded and its control flow reviewed in section 11 below. The console-only status here is historical.
 
 **Next:** collect `finalize()` bodies for the base and specialized queues using the read-only collector, and review the developer's local packet-lifetime evidence file. Keep AWDL runtime flags off.
 

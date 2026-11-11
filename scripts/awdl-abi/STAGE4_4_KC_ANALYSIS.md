@@ -2605,9 +2605,12 @@ belongs to an **as-yet unidentified private
 object**. It must NOT be conflated with
 `IOSkywalkTxSubmissionQueue`'s vptr
 `+0x1d8 = packetSubmission(bool)`.
-The object type must be traced from the
-initializer of `interface+0xa8` before
-naming its virtual.
+The subsequent local `IOSkywalkInterface::init`
+body identifies this object as **`OSSet`**, created
+with `OSSet::withCapacity(2)`. See section 30.
+The virtual method names still require an OSSet
+vtable lookup; they must not be named from offsets
+shared with unrelated classes.
 
 ### 29.4 Research approach: stop guessing and seek direct call sites
 
@@ -2658,3 +2661,131 @@ Keep
 and `ITLWM_AWDL_DATAPATH_LIVE=0`;
 no live queues, kext installation, EFI or
 runtime driver modifications.
+
+
+
+## 30. Private client OSSet and limited no-hit direct-call scan (2026-11-11)
+
+**Evidence:** developer's local Tahoe 25G332 KC output
+of `IOSkywalkInterface::{init,handleOpen,clientDisconnect}`,
+plus a read-only direct-call scan across
+`IOSkywalk/IOUserNetwork/IOEthernet` symbol families.
+
+### 30.1 The private object used by open/close is an OSSet
+
+`IOSkywalkInterface::init(OSDictionary*)` at
+`0xffffff8002b00a66` calls an inherited
+base init method and, if it succeeds:
+
+- optionally reads the `iosk_debug` boot argument
+  and ORs its value into `gIOSkywalkDebugFlags`;
+- allocates a private object/struct at
+  `interface+0xa8`;
+- creates **`OSSet::withCapacity(2)`** and
+  stores its pointer at `private+0x0`;
+- allocates an **`IOLock`** and stores
+  that pointer at `private+0x10`.
+
+The earlier `IOSkywalkInterface::willTerminate`
+writes a termination flag at
+`private+0x8`.
+
+This disambiguates the earlier calls:
+
+```text
+handleOpen:
+  lock(private+0x10)
+  OSSet(private+0x0)->vptr+0x1c0(client)
+  unlock(private+0x10)
+
+handleClose:
+  lock(private+0x10)
+  OSSet(private+0x0)->vptr+0x1d8(client)
+  unlock(private+0x10)
+```
+
+These are **OSSet methods, not TX submission
+callbacks**, despite `+0x1d8` also being
+the offset of the unrelated TX queue
+`packetSubmission(bool)` method.
+A local `OSSet` vtable lookup is still
+required to assign exact operation names
+to these two slots.
+
+`IOSkywalkInterface::clientDisconnect(IOService*,uint)`
+at `0xffffff8002b00d06` is an empty return
+and therefore adds no observed explicit TX
+detach or callback-drain operation.
+
+### 30.2 Exact bounded caller scan outcome and coverage
+
+The direct-call scanner completed on
+`BootKernelExtensions.kc` with:
+
+- **180 scanned / 2353 candidate function
+  symbols (7.65%)** in its prioritized,
+  alphabetically sorted pool;
+- **0 direct `call/jmp` hits** to the three
+  specified local addresses:
+  `IOWorkLoop::addEventSource`,
+  `IOWorkLoop::removeEventSource`,
+  `IOSkywalkTxSubmissionQueue::packetSubmission(bool)`;
+- **0 disassembly failures** and
+  **0 function bodies truncated**.
+
+The zero-hit result is **only about the
+180 checked functions**. There are
+2173 other candidate symbols not checked
+by this invocation. In addition, vtable
+or indirect dispatch, callbacks, inlined
+calls and different symbol families remain
+invisible to this method of searching.
+
+The direct-call scanner now supports
+`--skip-functions N` for predictable,
+bounded, non-overlapping scans of later
+slices of the same ranked symbol pool.
+Its output includes the 0-based selection
+range and total. This is static KC research,
+not a queue-activity test.
+
+### 30.3 Current lifetime conclusion
+
+`IOSkywalkInterface` has a private
+OSSet/IOLock-based client tracking mechanism
+and an independent termination flag.
+No provided body shows that client close,
+will/didTerminate, queue release or
+`setInterfaceEnable` removes the TX event
+source from its WorkLoop or drains
+non-workloop `packetSubmission` callbacks.
+
+The experimental backend's embedded
+`TxCallbackContext` must remain alive
+until all possible borrowed-`refCon` users
+have ceased entering and exited. The
+observed OSSet mechanics do not change
+that requirement.
+
+### 30.4 Next bounded checks
+
+1. Map `OSSet` object-vptr `+0x1c0` and
+   `+0x1d8` to identify the exact
+   client registry operations used in
+   `handleOpen/handleClose`.
+2. Scan the **next** ranked caller-function
+   slice with `--skip-functions 180` and
+   `--max-functions 180`, recording
+   the actual coverage and direct hits.
+3. If still no call sites, prioritize
+   **virtual and function-pointer-based
+   owners** rather than repeatedly assuming
+   that named method bodies will call
+   `removeEventSource()` directly.
+4. Keep the AWDL live registration and
+   datapath gates disabled. No EFI or
+   kext runtime changes.
+
+**Guardrail:** do not commit Apple proprietary
+KC disassembly; only interpreted call-site
+summaries and read-only research scripts.

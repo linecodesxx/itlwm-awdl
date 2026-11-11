@@ -34,6 +34,8 @@ FAMILIES = (
     "IOSkywalkPacket",  # exact 'Class::' match excludes other packet classes
     "IOSkywalkPacketBuffer",
     "IOSkywalkPacketTable",
+    "IOWorkLoop",
+    "IOEventSource",
 )
 DEFAULT_METHODS = (
     "legacyDequeue",

@@ -2493,9 +2493,10 @@ and does not rule out *direct* TX
 
 - Disassemble
   `IOSkywalkNetworkInterface::setInterfaceEnable`
-  (actual vptr `+0x930`) to see whether
-  it cascades to `LogicalLink::setEnable`,
-  changes producers, or invokes workloop detach.
+  (actual vptr `+0x930`): **subsequently confirmed
+  as a success-returning no-op for this exact class**;
+  see section 29. Subclasses may still override
+  the virtual, so actual dynamic dispatch matters.
 - Disassemble
   `IOSkywalkPacketQueue::setInterface`
   to verify whether queue->interface association
@@ -2512,3 +2513,148 @@ and does not rule out *direct* TX
 Guardrails: `ITLWM_AWDL_REGISTRATION_ENABLED=0`,
 `ITLWM_AWDL_DATAPATH_LIVE=0`, no kext
 loading, EFI modification or live AWDL traffic.
+
+
+
+## 29. SetInterfaceEnable is a no-op; queue association is borrowed (2026-11-11)
+
+**Evidence:** developer-supplied local Tahoe 25G332 KC
+bodies of `IOSkywalkNetworkInterface::setInterfaceEnable`,
+`IOSkywalkPacketQueue::setInterface`,
+`IOSkywalkInterface::{willTerminate,didTerminate,handleClose}`.
+No proprietary raw disassembly is reproduced here.
+
+### 29.1 Exact NetworkInterface implementation of setInterfaceEnable is empty
+
+`IOSkywalkNetworkInterface::setInterfaceEnable(bool)` at
+`0xffffff8002b10558` simply returns `0`
+(success) without reading its argument or accessing
+any queue, workloop, link or pool. Therefore,
+the `NetworkInterface::enable/disable` virtual
+`+0x930` operation is **not itself** an
+enable/disable cascade when the object uses
+this exact class vtable.
+
+**Subclasses could override vptr `+0x930`.**
+Therefore the no-op body does not establish that
+all possible concrete IOSkywalkNetworkInterface
+subclasses lack enable/disable side effects.
+An owner call graph must distinguish dynamic types.
+
+### 29.2 PacketQueue::setInterface stores a raw pointer and IDs
+
+`IOSkywalkPacketQueue::setInterface(IOSkywalkInterface*)`
+at `0xffffff8002b0dfa4`:
+
+1. Stores the supplied pointer in `queue+0x70`.
+2. If non-null, calls
+   `IORegistryEntry::getRegistryEntryID()` on
+   the interface; otherwise uses zero.
+3. Stores that same registry ID to both
+   `queue+0x90` and `queue+0xa0`.
+
+No `retain`, `release`, `WorkLoop::addEventSource`,
+`WorkLoop::removeEventSource`, callback cancellation
+or drain is evident in this setter. Consequently
+the interface pointer is **stored without a local
+retain**, and the owner must separately ensure
+its referent stays alive while any queue user
+could dereference `queue+0x70`.
+
+Section 28's `IOSkywalkInterface::registerInterfaceWithQueues`
+called this setter to establish the association.
+The corresponding deregistration routine merely
+released its queue `OSArray` and pool refs
+and did not iterate to `setInterface(nullptr)`.
+That is an **unresolved lifetime/ordering
+question**, not proof of a runtime UAF, because
+other owners may hold/release the queues or
+perform explicit teardown first.
+
+### 29.3 Termination hooks do not explicitly detach TX event sources
+
+`IOSkywalkInterface::willTerminate(IOService*,uint)`
+at `0xffffff8002b00dfe` sets byte
+`private+0x8=1` through `interface+0xa8`,
+then returns true. This is a state flag,
+not a workloop drain or queue detach.
+
+`IOSkywalkInterface::didTerminate(IOService*,uint,bool*)`
+at `0xffffff8002b00e12` calls one method
+through a statically loaded inherited vtable
+entry `+0x410`, and conditionally tail-calls
+another entry `+0x418` depending on the
+first call's Boolean result. These concrete
+function targets have not yet been resolved;
+the shown body itself does not remove
+TX event sources or wait for callbacks.
+
+`IOSkywalkInterface::handleClose(IOService*,uint)`
+at `0xffffff8002b00c54`:
+
+- Acquires an `IOLock` stored in
+  `interface+0xa8 -> private+0x10`.
+- Loads a private object from
+  `interface+0xa8 -> private+0x0`, and
+  calls **that object's** vptr `+0x1d8`
+  with the closing client.
+- Releases the same lock.
+
+**Important disambiguation:** this `+0x1d8`
+belongs to an **as-yet unidentified private
+object**. It must NOT be conflated with
+`IOSkywalkTxSubmissionQueue`'s vptr
+`+0x1d8 = packetSubmission(bool)`.
+The object type must be traced from the
+initializer of `interface+0xa8` before
+naming its virtual.
+
+### 29.4 Research approach: stop guessing and seek direct call sites
+
+Repeated named-method analysis has not
+revealed any explicit owner-side
+`IOWorkLoop::removeEventSource(txQueue)`
+call. To progress, added a **read-only, bounded**
+collector
+`scripts/awdl-abi/scan_skywalk_direct_calls.py`
+that scans selected locally disassembled
+symbolic function bodies for **direct**
+`call` or `jmp` targets at known local
+25G332 addresses:
+
+- `IOWorkLoop::addEventSource`:
+  `0xffffff8000acaf80`.
+- `IOWorkLoop::removeEventSource`:
+  `0xffffff8000acb070`.
+- `IOSkywalkTxSubmissionQueue::packetSubmission(bool)`:
+  `0xffffff8002b31d68`.
+
+The script reports caller names, call-site
+addresses, matched target, bounded scan
+coverage and truncation/failures, with
+**no verbatim disassembly in the output**.
+Its address constants are tied to Tahoe
+25G332; do not run them unverified on
+another kernel build.
+
+**LIMITATION:** direct-target searching misses
+indirect calls, vtable dispatch, wrapper
+functions outside selected symbol families,
+inlining and any target call past scan
+limits. No matches is **not** a proof
+that callback invocations cannot occur.
+
+### 29.5 Safety verdict
+
+The local KC exposes a pointer-only
+interface-to-queue association, state flag
+on termination and lock-protected close
+handling, but **none proves an owner-side
+no-future-entry + in-flight-drain barrier**
+for the borrowed
+`SkywalkBackend::txCallbackContext_`.
+Keep
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`
+and `ITLWM_AWDL_DATAPATH_LIVE=0`;
+no live queues, kext installation, EFI or
+runtime driver modifications.

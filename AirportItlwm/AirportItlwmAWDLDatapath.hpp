@@ -138,7 +138,7 @@ enum Status : int {
  * packets. It never claims that a packet was transmitted.
  */
 struct TxAction {
-    uint32_t (*dequeue)(void *context, void *const *packets, uint32_t count);
+    uint32_t (*invoke)(void *context, void *const *packets, uint32_t count);
     void *context;
 };
 
@@ -150,9 +150,9 @@ struct TxAction {
 inline uint32_t dispatchTxAction(const TxAction &action,
                                  void *const *packets, uint32_t count)
 {
-    if (action.dequeue == nullptr || packets == nullptr || count == 0)
+    if (action.invoke == nullptr || packets == nullptr || count == 0)
         return 0;
-    uint32_t consumed = action.dequeue(action.context, packets, count);
+    uint32_t consumed = action.invoke(action.context, packets, count);
     return consumed <= count ? consumed : 0;
 }
 

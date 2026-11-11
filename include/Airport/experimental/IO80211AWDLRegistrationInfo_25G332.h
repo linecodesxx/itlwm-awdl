@@ -29,15 +29,16 @@
  *   IOSkywalkNetworkInterface::getTxDataOffset
  *       0xffffff8002b10aba
  *       reads a uint16_t at info + 0x3c. The base initRegistrationInfo()
- *       zeroes it. AppleBCMWLANProximityInterface::start() does not patch it,
- *       so an AWDL RegistrationInfo built from the base fallbacks has
- *       headroom 0. A live path must take the value from the controller.
+ *       zeroes it. AppleBCMWLANCore::createProxInterface() explicitly writes
+ *       0x40 to this field before calling ProximityInterface::start().
  *
  *   AppleBCMWLANProximityInterface::start
  *       0xffffff800172d3a6
  *       patches +0x48 and +0x4c to 0x59400000594 (both MTU fields = 1428).
- *       It does not patch +0x3c, +0x28 (media) or +0x44 (min packet size).
- *       AppleBCMWLANProximityInterface::getBSDNamePrefix returns "awdl".
+ *       The preceding AppleBCMWLANCore::createProxInterface() patches
+ *       +0x0c=3, +0x14=2, +0x24/+0x28=0x80, +0x30="awdl",
+ *       +0x3c=0x40 and +0x40=4 (or 6 depending on power state).
+ *       ProximityInterface::start() patches both MTU fields to 1428.
  *
  *   IOSkywalkEthernetInterface::copyRegistrationInfo
  *       0xffffff8002b159f0
@@ -87,16 +88,20 @@ constexpr uint32_t kMacAddressLength = 6;
 /*
  * AWDL values verified in AppleBCMWLANProximityInterface on 25G332.
  *
- * - start() patches both MTU fields to 0x594 (1428), not the 0x5dc (1500)
- *   Ethernet fallback.
- * - getBSDNamePrefix() returns the literal "awdl".
- * - start() does not patch headroom, media or minimum packet size, so those
- *   keep the base initRegistrationInfo() fallbacks. Headroom is 0 in the base
- *   buffer; a live path must replace it with the controller's value.
+ * AppleBCMWLANCore::createProxInterface() initializes the base registration
+ * buffer and then patches the AWDL-specific fields BEFORE calling start():
+ *   +0x0c=3; +0x14=2; +0x24/+0x28=0x80; +0x30="awdl";
+ *   +0x3c=64; +0x40=4 (or 6 for the power-state conditional).
+ * ProximityInterface::start() then sets both MTU fields to 1428.
+ * These are KC observations, NOT evidence that runtime registration is safe.
  */
-constexpr uint32_t kAwdlMaxTransferUnit = 0x594; /* 1428 */
-constexpr uint16_t kAwdlTxDataOffset = 0;        /* base init zeroes +0x3c */
-constexpr uint32_t kAwdlInitialMedia = 0x20;
+constexpr uint32_t kAwdlInterfaceSubFamily = 3;
+constexpr uint32_t kAwdlMediaCapacity = 2;
+constexpr uint32_t kAwdlInitialActiveMedia = 0x80; /* ifm_active */
+constexpr uint32_t kAwdlInitialMedia = 0x80;       /* ifm_current */
+constexpr uint32_t kAwdlMaxTransferUnit = 0x594;  /* 1428 */
+constexpr uint16_t kAwdlTxDataOffset = 0x40;       /* 64-byte headroom */
+constexpr uint32_t kAwdlOptionsDefault = 4;       /* 6 on power-state condition */
 constexpr uint32_t kAwdlMinPacketSize = 0x2e;
 constexpr char kAwdlBsdNamePrefix[] = "awdl";
 
@@ -110,15 +115,16 @@ struct NetworkRegistrationInfoPrefix {
     uint32_t interfaceFamily;         /* +0x08 */
     uint32_t interfaceSubFamily;      /* +0x0c */
     uint8_t  reserved0[0x04];         /* +0x10 */
-    uint32_t maxSize;                 /* +0x14, must be <= 0x400 */
+    uint32_t supportedMediaCapacity;  /* +0x14, must be <= 0x400 */
     uint8_t  reserved1[0x0c];         /* +0x18 */
-    uint32_t reserved2;               /* +0x24, init writes 0x22 */
-    uint32_t initialMedia;            /* +0x28 */
+    uint32_t initialActiveMedia;      /* +0x24, ifm_active */
+    uint32_t initialMedia;            /* +0x28, ifm_current */
     uint8_t  reserved3[0x04];         /* +0x2c */
     uintptr_t bsdNamePrefix;          /* +0x30, pointer-sized */
     uint32_t bsdUnitNumber;           /* +0x38 */
     uint16_t txDataOffset;            /* +0x3c, getTxDataOffset reads u16 */
-    uint8_t  reserved4[0x06];         /* +0x3e */
+    uint8_t  reserved4[0x02];         /* +0x3e .. +0x3f */
+    uint32_t awdlOptions;             /* +0x40, Proxi builder writes 4 or 6 */
     uint32_t minPacketSize;           /* +0x44 */
     uint32_t maxTransferUnit;         /* +0x48 */
     uint32_t maxTransferUnit2;        /* +0x4c */
@@ -144,12 +150,13 @@ static_assert(offsetof(NetworkRegistrationInfoPrefix, version) == 0x00, "version
 static_assert(offsetof(NetworkRegistrationInfoPrefix, size) == 0x04, "size offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, interfaceFamily) == 0x08, "interfaceFamily offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, interfaceSubFamily) == 0x0c, "interfaceSubFamily offset");
-static_assert(offsetof(NetworkRegistrationInfoPrefix, maxSize) == 0x14, "maxSize offset");
-static_assert(offsetof(NetworkRegistrationInfoPrefix, reserved2) == 0x24, "reserved2 offset");
+static_assert(offsetof(NetworkRegistrationInfoPrefix, supportedMediaCapacity) == 0x14, "supportedMediaCapacity offset");
+static_assert(offsetof(NetworkRegistrationInfoPrefix, initialActiveMedia) == 0x24, "initialActiveMedia offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, initialMedia) == 0x28, "initialMedia offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, bsdNamePrefix) == 0x30, "bsdNamePrefix offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, bsdUnitNumber) == 0x38, "bsdUnitNumber offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, txDataOffset) == 0x3c, "txDataOffset offset");
+static_assert(offsetof(NetworkRegistrationInfoPrefix, awdlOptions) == 0x40, "awdlOptions offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, minPacketSize) == 0x44, "minPacketSize offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, maxTransferUnit) == 0x48, "maxTransferUnit offset");
 static_assert(offsetof(NetworkRegistrationInfoPrefix, maxTransferUnit2) == 0x4c, "maxTransferUnit2 offset");
@@ -158,8 +165,8 @@ static_assert(kNetworkRegistrationMinSize < kEthernetRegistrationSize,
               "network registration consumes a prefix of the Ethernet object");
 static_assert(kAwdlMaxTransferUnit == 1428,
               "AppleBCMWLANProximityInterface patches AWDL MTU to 0x594");
-static_assert(kAwdlTxDataOffset == 0,
-              "base initRegistrationInfo zeroes the AWDL headroom field");
+static_assert(kAwdlTxDataOffset == 64,
+              "AppleBCMWLANCore::createProxInterface writes 64 bytes of headroom");
 static_assert(sizeof(kAwdlBsdNamePrefix) == 5,
               "AppleBCMWLANProximityInterface::getBSDNamePrefix returns \"awdl\"");
 

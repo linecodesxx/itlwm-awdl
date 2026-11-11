@@ -55,6 +55,7 @@ DEFAULT_METHODS = (
     "releaseAllMemorySegments",
     "completeWithQueue",
     "disposePacket",
+    "finalize",
 )
 
 

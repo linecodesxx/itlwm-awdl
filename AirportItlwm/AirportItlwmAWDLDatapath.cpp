@@ -155,7 +155,7 @@ IOSkywalkRxCompletionQueue *createRxCompletionLive(
 class SkywalkBackend : public itlwm_awdl_datapath::Backend {
 public:
     explicit SkywalkBackend(OSObject *owner)
-        : owner_(owner), txCallbackContext_{owner, {nullptr, nullptr}} {}
+        : owner_(owner), txCallbackContext_{owner, {nullptr, nullptr}, {}} {}
     
     ~SkywalkBackend() override
     {
@@ -253,6 +253,12 @@ public:
          */
         switch (kind) {
         case itlwm_awdl_datapath::Resource::TxSubmissionQueue: {
+            /*
+             * Disallow new admitted callbacks before disabling/releasing the
+             * queue. This does NOT prove the queue has stopped calling refCon;
+             * a live path must separately establish callback quiescence.
+             */
+            txCallbackContext_.gate.close();
             IOSkywalkTxSubmissionQueue *q =
                 static_cast<IOSkywalkTxSubmissionQueue *>(queue);
             q->disable();

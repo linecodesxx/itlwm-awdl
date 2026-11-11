@@ -661,3 +661,123 @@ then write an explicit two-phase `detach -> no future entry ->
 drain -> destroy` protocol. Do not wire live Skywalk queues,
 claim packets, or flip `ITLWM_AWDL_DATAPATH_LIVE` until those
 guarantees have independent evidence.
+
+
+
+## 15. TX submission callback registration and rescheduling (local 25G332 KC)
+
+**Evidence:** developer-provided `awdl-skywalk-tx-entry.txt`,
+locally extracted from `BootKernelExtensions.kc` (2026-11-11).
+The uploaded report contains disassembly for:
+`TxSubmissionQueue::initWithPool`, `checkForWork`, and two
+`packetSubmission` overloads. Here are the key control-flow
+findings, without publishing proprietary instruction dumps.
+
+### 15.1 initWithPool: the queue stores two separate callback paths
+
+`IOSkywalkTxSubmissionQueue::initWithPool`
+at `0xffffff8002b11aac`:
+
+- Rejects capacity argument `< 8`, null pool,
+  null **packet-array submission callback** and
+  flags `> 0x1f`.
+- Dispatches through the **raw** base
+  `__ZTV20IOSkywalkPacketQueue + 0x240` entry, which corresponds to
+  object-vptr offset `+0x230`. The base method's exact identity and
+  field assignments should be checked, not inferred solely from the
+  call name in this specialized method.
+- On success stores the first queue-specific unsigned argument
+  in `queue+0xb8` and the **optional budget/space callback**
+  (the first callback argument in this signature, at
+  `[rbp+0x10]`) at `queue+0xf0`.
+- Creates a packet table with `queue+0xac` as its capacity,
+  stores it at `queue+0xe8` and allocates stats at `+0x100`.
+  The field `+0xac` is therefore **definitely used as the
+  allocation/table size here**; its exact mapping to the
+  external `withPool` capacity argument still requires the
+  base init method.
+- The mandatory packet-array callback (second function-pointer
+  parameter), owner, and `refCon` are passed to the base init
+  through the stack. Prior `legacyDequeue` evidence shows an
+  indirect packet callback at queue `+0x20`, the callback target
+  at `+0x18` and the `refCon` at `+0x58`.
+  Whether these are all retained/cleared during teardown must
+  be verified against base init and owner detach.
+
+**Important:** The optional `queue+0xf0` callback used for a
+budget/space calculation has **different signature and semantics**
+from the mandatory packet-array submission callback reached by
+`legacyDequeue()`. Do not conflate them or treat the former's
+return as a count of packets consumed.
+
+### 15.2 checkForWork: pending generation and state-gated calls
+
+`IOSkywalkTxSubmissionQueue::checkForWork()`
+at `0xffffff8002b31746` initially compares event-generation
+fields `queue+0x14c` and `+0x148`, and returns when equal.
+On work, it updates the observed value and follows a mixture
+of feature flags, statistics and queue states. Paths include:
+
+- virtual queue `+0x1d8` on one configuration;
+- `packetSubmissionForKPipe(false)` in another branch;
+- queue virtual `+0x1e0` when state bits at `+0x28` and
+  `+0xcc` permit it.
+
+This shows a second scheduler/entry mechanism for TX work
+besides direct calls to the packetSubmission methods, and is
+consistent with deferred event-source work. Exact vptr targets
+need separate lookup.
+
+### 15.3 packetSubmission(bool): work can be deferred
+
+`IOSkywalkTxSubmissionQueue::packetSubmission(bool)`
+at `0xffffff8002b31d68`:
+
+- Checks queue enable flag `+0x28` and on a true argument
+  tries `IOEventSource::tryCloseGate()`.
+- On failure to acquire the gate, increments a work-generation
+  field `+0x148` and invokes
+  `IOEventSource::signalWorkAvailable()` instead of entering
+  packet processing synchronously.
+- The local packet path checks state and capacity, invokes the
+  optional budget callback at `queue+0xf0` when non-null,
+  can call `refillTxRingForNetworking`, then calls
+  `legacyDequeue()`; the alternate path uses
+  `getPacketListForNetworking` then `listDequeue()`.
+- It reopens the gate on the acquired-gate path.
+
+**Lifetime consequence:** the ability to queue work via
+`signalWorkAvailable()` means merely closing a driver-owned
+`CallbackGate` and observing zero admitted callbacks is not
+sufficient to prove the workloop event source can never run
+again and dereference the queue's callback/refCon.
+
+### 15.4 packetSubmission(out pointers): another gated path
+
+`IOSkywalkTxSubmissionQueue::packetSubmission(uint64_t*,
+uint32_t*,uint32_t*)` at `0xffffff8002b31b2a`
+checks queue enable state, calls `IOEventSource::closeGate()`,
+optionally invokes the same budget callback `queue+0xf0`,
+then processes native packet handles via
+`IOSkywalkPacketBufferPool::getPacketWithHandle`,
+`IOSkywalkPacketTable::producePacket`, and
+`legacyDequeue()`. It reopens the gate on its active path.
+No demonstrated no-future-entry barrier is present in this
+single function.
+
+### 15.5 Next proof obligation: owner-side detach
+
+The above establishes **a callback invocation path plus a
+deferred work-event path**, not the final ownership contract.
+Before a Stage 5 live callback, independently establish:
+
+1. Which owner/workloop calls `addEventSource` and later
+   `removeEventSource`, with correct locking and lifetime.
+2. Whether `removeEventSource` guarantees no later
+   `checkForWork` / `packetSubmission` / `legacyDequeue`
+   invocations with borrowed `refCon`.
+3. Drain all callbacks that were already admitted, including
+   direct calls from the owner and deferred events, **after**
+   future entry is ruled out.
+4. Preserve the existing Stage 4 fail-closed
+   `ITLWM_AWDL_DATAPATH_LIVE=0` and registration disabled.

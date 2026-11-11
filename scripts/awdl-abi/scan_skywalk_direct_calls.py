@@ -21,6 +21,7 @@ TARGETS = {
     0xffffff8002b31d68: 'IOSkywalkTxSubmissionQueue::packetSubmission(bool)',
 }
 BRANCH = re.compile(r'\b(call|jmp)\s+(0x[0-9a-fA-F]+)\b')
+INDIRECT = re.compile(r'\b(call|jmp)\s+qword ptr\s+\[([a-z0-9]+)\s*\+\s*(0x[0-9a-fA-F]+)\]')
 PRIORITY = ('register', 'deregister', 'attach', 'detach', 'initialize',
             'initWith', 'start', 'stop', 'enable', 'disable', 'finalize',
             'free', 'workLoop', 'queue', 'packet')
@@ -46,14 +47,24 @@ def main():
     parser.add_argument('--skip-functions', type=int, default=0,
                         help='Skip this many ranked unique functions before scanning')
     parser.add_argument('--max-lines', type=int, default=400)
+    parser.add_argument('--virtual-offsets', default='',
+                        help='Comma-separated indirect call slot offsets to flag (candidate only)')
+    parser.add_argument('--max-virtual-hits', type=int, default=80)
     parser.add_argument('--out', default='/tmp/awdl-skywalk-direct-callers.txt')
     args = parser.parse_args()
     if args.skip_functions < 0:
         parser.error('--skip-functions must be nonnegative')
-    if args.max_functions <= 0 or args.max_lines <= 0:
+    if args.max_functions <= 0 or args.max_lines <= 0 or args.max_virtual_hits <= 0:
         parser.error('limits must be positive')
     if not os.path.isfile(args.kc) or not os.path.isdir(args.wtlkcabi):
         parser.error('local KC or WTLKcAbi directory missing')
+    try:
+        virtual_offsets = set(int(x.strip(), 0) for x in
+                              args.virtual_offsets.split(',') if x.strip())
+    except ValueError:
+        parser.error('invalid --virtual-offsets value')
+    if any(x < 0 or x % 8 for x in virtual_offsets):
+        parser.error('--virtual-offsets must be nonnegative 8-byte multiples')
     prefixes = tuple(p.strip() for p in args.families.split(',') if p.strip())
     if not prefixes:
         parser.error('provide at least one family prefix')
@@ -90,7 +101,7 @@ def main():
     if not os.environ.get('LLVM_OBJDUMP') and os.path.isfile(OBJDUMP_FALLBACK):
         os.environ['LLVM_OBJDUMP'] = OBJDUMP_FALLBACK
     from disasm import Disassembler
-    hits, errors, truncated = [], 0, 0
+    hits, indirect_hits, errors, truncated = [], [], 0, 0
     with tempfile.TemporaryDirectory(prefix='itlwm-awdl-calls-') as workdir:
         dis = Disassembler(kc, workdir)
         for _, readable, address in selected:
@@ -102,6 +113,13 @@ def main():
             if len(lines) > args.max_lines:
                 truncated += 1
             for line in lines[:args.max_lines]:
+                if virtual_offsets:
+                    indirect = INDIRECT.search(line)
+                    if indirect and int(indirect.group(3), 16) in virtual_offsets:
+                        indirect_hits.append((readable, '%#x' % address,
+                                              line.split(':', 1)[0].strip(),
+                                              indirect.group(1), indirect.group(2),
+                                              int(indirect.group(3), 16)))
                 found = BRANCH.search(line)
                 if not found:
                     continue
@@ -128,13 +146,27 @@ def main():
                       (caller, address, kind, site, target))
         if not hits:
             out.write('No direct calls found in this BOUNDED selection.\n')
+        if virtual_offsets:
+            out.write('\nCANDIDATE indirect slot calls: %d total; showing up to %d\n' %
+                      (len(indirect_hits), args.max_virtual_hits))
+            out.write('Requested slot offsets: %s\n' %
+                      ', '.join('%#x' % x for x in sorted(virtual_offsets)))
+            for caller, address, site, kind, register, offset in indirect_hits[:args.max_virtual_hits]:
+                out.write('%s (%s): %s at %s via [%s + %#x]\n' %
+                          (caller, address, kind, site, register, offset))
+            if len(indirect_hits) > args.max_virtual_hits:
+                out.write('... %d more candidates omitted by report limit\n' %
+                          (len(indirect_hits) - args.max_virtual_hits))
+            out.write('CAUTION: an indirect memory call matching an offset does NOT\n'
+                      'prove receiver class, vtable usage, or target method.\n')
         out.write('\nLIMITATION: misses indirect/virtual calls, other symbol '
                   'families, functions outside scan limit, and calls '
                   'beyond max-lines. No-hit is NOT a safety proof.\n')
         out.write('No proprietary disassembly is included in this report.\n')
     print('Saved interpreted call-site summary:', args.out)
     print('Scanned:', len(selected), 'of', len(deduped), 'symbolic functions; range:',
-          start_index, '-', start_index + len(selected), '; hits:', len(hits))
+          start_index, '-', start_index + len(selected), '; direct hits:',
+          len(hits), '; candidate indirect-slot hits:', len(indirect_hits))
     return 0
 
 

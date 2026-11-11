@@ -2,7 +2,8 @@
 """Read-only, bounded direct-call xrefs from local Tahoe 25G332 KC.
 
 Reports symbolic callers of three addresses without emitting disassembly.
-Cannot detect virtual, indirect or inlined calls, so absence is NOT proof.
+Optionally flags indirect slot-call shapes as UNVERIFIED candidates.
+Misses other indirect forms, inlining, and out-of-scope callers; no-hit is NOT proof.
 """
 import argparse
 import os
@@ -159,9 +160,12 @@ def main():
                           (len(indirect_hits) - args.max_virtual_hits))
             out.write('CAUTION: an indirect memory call matching an offset does NOT\n'
                       'prove receiver class, vtable usage, or target method.\n')
-        out.write('\nLIMITATION: misses indirect/virtual calls, other symbol '
-                  'families, functions outside scan limit, and calls '
-                  'beyond max-lines. No-hit is NOT a safety proof.\n')
+        out.write('\nLIMITATION: the direct scan misses indirect/virtual calls; '
+                  'the optional slot scan covers only call/jmp qword ptr '
+                  '[reg+offset] shapes and cannot infer receiver class. '
+                  'Other families, functions outside scan limit, and '
+                  'calls beyond max-lines are excluded. '
+                  'No-hit is NOT a safety proof.\n')
         out.write('No proprietary disassembly is included in this report.\n')
     print('Saved interpreted call-site summary:', args.out)
     print('Scanned:', len(selected), 'of', len(deduped), 'symbolic functions; range:',

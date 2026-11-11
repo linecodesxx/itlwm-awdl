@@ -40,7 +40,7 @@ Consequently, the production submission callback is **never admitted**, the comp
 - `AirportItlwmAWDLInterface` remains `0x130` bytes with the same 571-entry vtable.
 - Default `ITLWM_AWDL_EXPERIMENTAL=0`; static asserts enforce `ITLWM_AWDL_REGISTRATION_ENABLED == 0` and `ITLWM_AWDL_DATAPATH_LIVE == 0`.
 - No new `registerEthernetInterface`, attach/start, firmware TX/RX, `awdl0`, EFI or boot-argument changes.
-- **Status:** source changes pushed to this branch. The independent callback-gate C++14 fragment compiled in a host smoke check; the **full updated repository test suite and Tahoe builds have not yet been run**.
+- **Status:** local developer verification was reported on 2026-11-11 (see below). No kernel runtime validation has been performed.
 
 ### Run on the Mac
 
@@ -76,3 +76,24 @@ No kext install or reboot is needed. Do **not** enable registration or live data
 2. Prove queue callback quiescence/no-further-entry before backend lifetime ends; encode that requirement in the future registration teardown path.
 3. Establish owner locking and drain guarantees, plus correct PoolOptions and queue IDs.
 4. Integrate actual packet ownership accounting with complete/drop only after a real packet path exists.
+
+
+## Developer verification results (2026-11-11)
+
+The developer reported the following after applying the const-correctness fix
+in commit `0d635a7` to the Stage 4.2 branch:
+
+- Experimental `AirportItlwm-Tahoe` Debug x86_64 build: **BUILD SUCCEEDED**.
+- `verify_datapath.py`: **ALL CHECKS PASSED** (host tests with `-Werror`,
+  source gates, kernel object imports, datapath isolation).
+- `verify_awdl_class.py`: **ALL CHECKS PASSED** (571-entry vtable,
+  0x130 instance, 63 verified AWDL slots).
+- `verify_abi.py`: **ALL CHECKS PASSED**.
+- `verify_slots_kc.py`: **ALL SLOT CHECKS PASSED** (63/63).
+- `WTLKcAbi/linkcheck.py` against the experimental kext at
+  `/tmp/awdl42-experimental/Build/Products/Debug/Tahoe/AirportItlwm.kext`:
+  **link check ok**, 1085 symbols all resolved in declared KC dependencies.
+
+The default (nonexperimental) Stage 4.2 build was requested but not
+confirmed in the supplied logs. None of these results proves queue callback
+quiescence, correct hardware TX/RX completion, or safe load/unload.

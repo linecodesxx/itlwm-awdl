@@ -13,6 +13,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <atomic>
+#include <thread>
 
 using namespace itlwm_awdl_datapath;
 
@@ -198,6 +200,44 @@ static void test_callback_gate()
     CHECK(closedBeforeArm.drained());
 }
 
+static void test_callback_gate_concurrent_close()
+{
+    CallbackGate gate;
+    CHECK(gate.arm());
+
+    std::atomic<bool> entered(false);
+    std::atomic<bool> leave(false);
+    std::thread worker([&]() {
+        CallbackLease admission(gate);
+        if (!admission.acquired()) {
+            entered.store(true, std::memory_order_release);
+            return;
+        }
+        entered.store(true, std::memory_order_release);
+        while (!leave.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    });
+
+    for (int n = 0; n < 100000 &&
+         !entered.load(std::memory_order_acquire); ++n)
+        std::this_thread::yield();
+
+    if (entered.load(std::memory_order_acquire)) {
+        CHECK(gate.activeCount() == 1);
+        gate.close();
+        CHECK(!gate.enter());
+        CHECK(!gate.drained());
+    } else {
+        CHECK(false); /* worker did not enter within bounded wait */
+        gate.close();
+    }
+    leave.store(true, std::memory_order_release);
+    worker.join();
+    CHECK(gate.closed());
+    CHECK(gate.drained());
+    CHECK(gate.activeCount() == 0);
+}
+
 static Config makeConfig()
 {
     Config c;
@@ -212,6 +252,45 @@ static Config makeConfig()
     c.txCompletionQueueId = 2;
     c.rxCompletionQueueId = 3;
     return c;
+}
+
+class ReentrantBackend : public FakeBackend {
+public:
+    Manager *manager = nullptr;
+    Config config;
+
+    void *createPool(const char *name, const PoolOptions &opts) override
+    {
+        if (manager != nullptr) {
+            CHECK(manager->teardown() == kBusy);
+            CHECK(manager->initialize(config) == kBusy);
+        }
+        return FakeBackend::createPool(name, opts);
+    }
+
+    void destroyQueue(void *queue, Resource kind) override
+    {
+        if (manager != nullptr) {
+            CHECK(manager->teardown() == kBusy);
+            CHECK(manager->initialize(config) == kBusy);
+        }
+        FakeBackend::destroyQueue(queue, kind);
+    }
+};
+
+static void test_reentrant_manager_transitions()
+{
+    ReentrantBackend backend;
+    Manager manager(backend);
+    backend.manager = &manager;
+    backend.config = makeConfig();
+
+    CHECK(manager.initialize(backend.config) == kOk);
+    CHECK(manager.state() == State::Ready);
+    CHECK(manager.teardown() == kOk);
+    CHECK(manager.state() == State::TornDown);
+    CHECK(backend.poolDestroys == 2);
+    CHECK(backend.queueDestroys == 3);
 }
 
 static void test_initial_state()
@@ -467,6 +546,8 @@ int main()
 {
     test_callback_dispatch();
     test_callback_gate();
+    test_callback_gate_concurrent_close();
+    test_reentrant_manager_transitions();
     test_initial_state();
     test_success_and_teardown();
     test_initialize_twice();

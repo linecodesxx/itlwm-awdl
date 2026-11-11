@@ -2160,11 +2160,14 @@ at `0xffffff8002b0ee66`:
   state, and when present invokes
   `deregisterNetworkInterface`.
 - Tail-calls the superclass
-  `IOSkywalkInterface::stop(IOService*)`
-  through raw base vtable `__ZTV+0x5d8`.
-  The actual superclass method body remains
-  to be inspected before asserting it does
-  or does not detach event sources.
+  the slot at raw `IOSkywalkInterface` base-vtable
+  `__ZTV+0x5d8` (object-vptr `+0x5c8`).
+  **The exact target is not resolved:** the local
+  `IOSkywalkInterface` symbol inventory does not
+  include a class-defined `stop()` override, so
+  naming this target `IOSkywalkInterface::stop`
+  would be premature. Resolve the vptr before
+  attributing detach or drain behavior to it.
 
 `IOSkywalkNetworkInterface::free()`
 at `0xffffff8002b0effe`:
@@ -2224,3 +2227,120 @@ to invoke TX submission callbacks specifically.
 **Evidence status:** static owner cleanup is better
 understood, but the full callback lifetime
 invariant is still unproven.
+
+
+
+## 27. NetworkInterface enable/disable virtual and new IOSkywalkInterface lifecycle candidates (2026-11-11)
+
+**Evidence:** user-supplied Tahoe 25G332
+`BootKernelExtensions.kc` symbol inventory
+for `IOSkywalkInterface` (38 matched symbols)
+and disassembly of
+`IOSkywalkNetworkInterface::{enable,disable}`.
+This report records only interpreted control flow.
+
+### 27.1 NetworkInterface enable delegates a bool to object-vptr +0x930
+
+`IOSkywalkNetworkInterface::enable(unsigned)` at
+`0xffffff8002b1041a`:
+
+- Calls a virtual method on **the concrete
+  network-interface object**, vptr `+0x930`,
+  with bool argument `true` (in `esi=1`).
+  The first method's `unsigned` parameter is
+  not forwarded to this call.
+- Uses the zero/nonzero return code to set
+  the byte at `interface+0xd8` to 1 only on
+  success (`sete` after `test eax,eax`).
+- Does not itself call
+  `IOWorkLoop::addEventSource`,
+  `packetSubmission`, or an explicit queue
+  callback barrier.
+
+**Do not label virtual +0x930 until it has been
+resolved in the actual `IOSkywalkNetworkInterface`
+vtable.** The next research question is whether
+it invokes `LogicalLink::setEnable`/
+`QueueSet::setEnable` or another higher-level
+network enable transition.
+
+### 27.2 NetworkInterface disable uses atomic state transition
+
+`IOSkywalkNetworkInterface::disable(unsigned)`
+at `0xffffff8002b10442`:
+
+1. Performs a locked `cmpxchg` at
+   `interface+0xd8`, expecting old value
+   1 and replacing it with 0. Returns
+   immediately when the transition fails.
+2. On the successful 1 -> 0 path, invokes
+   the **same virtual `+0x930` with false**.
+   Its return value is not checked in the
+   shown caller before subsequent actions.
+3. Inspects private registration data at
+   `interface+0xc0`. Under a flag condition
+   at `private+0x3c`, calls
+   `reportLinkStatus(1,flags)` with an
+   argument derived from `private+0x30`.
+4. Clears `private+0x3c` and returns.
+
+There is no direct `IOWorkLoop::removeEventSource`
+or callback-drain call in this body. The
+atomic enabled-state guard reduces repeat
+disable work but does **not** prove that
+external TX producers are stopped or that
+already executing callbacks finished.
+
+### 27.3 New named superclass interface registration entrypoints
+
+The `IOSkywalkInterface` inventory includes
+two especially relevant methods:
+
+- `IOSkywalkInterface::registerInterfaceWithQueues(
+  IOSkywalkPacketQueue**,unsigned,
+  IOSkywalkPacketBufferPool*,
+  IOSkywalkPacketBufferPool*,unsigned)`
+  at `0xffffff8002b00d0c`.
+- `IOSkywalkInterface::deregisterInterfaceWithQueues()`
+  at `0xffffff8002b00b9c`.
+
+Other named lifecycle methods include
+`IOSkywalkInterface::free()` at
+`0xffffff8002b00b14`,
+`didTerminate` and `willTerminate`.
+These are more specific next candidates
+for the queue attachment/teardown contract
+than a generic superclass stop symbol.
+
+**Important correction to section 26.3:**
+`IOSkywalkNetworkInterface::stop` tail-calls
+a raw `IOSkywalkInterface` *base vtable
+entry `__ZTV+0x5d8`*, corresponding to
+object-vptr `+0x5c8`. No
+`IOSkywalkInterface::stop` override appears
+in this local symbol inventory, so the
+actual function could be inherited from a
+superclass. Its identity must be resolved
+from the local vtable instead of inferred
+from the class whose table is referenced.
+
+### 27.4 Next bounded evidence
+
+Resolve `IOSkywalkNetworkInterface`
+object-vptr `+0x930` and the
+`IOSkywalkInterface` base slot `+0x5c8`.
+Then disassemble the **actual** superclass
+`registerInterfaceWithQueues`,
+`deregisterInterfaceWithQueues`, and
+`free` bodies, looking for
+`IOWorkLoop::addEventSource/removeEventSource`
+and reference/producer sequencing. These
+methods may delegate via more virtual calls,
+so their names alone do not prove they
+implement the detach protocol.
+
+Keep the 25G332 research read-only:
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`;
+`ITLWM_AWDL_DATAPATH_LIVE=0`. No kext
+installation, native queue registration,
+EFI, or runtime-code changes.

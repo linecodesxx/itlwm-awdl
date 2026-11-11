@@ -73,11 +73,18 @@ It is **not** proof of the private `IOSkywalk*` behavior in the 25G332 KC.
 
 ## Verification status
 
-New Stage 4.3 changes have **not yet been built/tested on the Mac**.
-Stage 4.2 predecessor was verified locally (see
-`STAGE4_2_SAFETY_REVIEW.md`). Since this branch only adds a host-only
-header/test and updates the verifier, the current experimental driver
-sources are unchanged; nevertheless, re-run the verifiers.
+**Host-side verification PASS (developer-reported, 2026-11-11).**
+`python3 scripts/awdl-abi/verify_datapath.py` built both C++14 host test
+binaries with `-Werror`; all existing datapath and new packet-flow tests
+passed. Source gates, isolation checks and the experimental backend object's
+four 25G332 Skywalk factory imports also passed; final output:
+`ALL CHECKS PASSED`.
+
+This Stage 4.3 check does **not** by itself verify a fresh default/experimental
+full Xcode build, KC ABI slot checks or linkcheck on this branch. The
+predecessor Stage 4.2 did pass the previously supplied experimental build,
+ABI checks and linkcheck; see `STAGE4_2_SAFETY_REVIEW.md`.
+The production AWDL datapath is still not connected or enabled.
 
 ```sh
 cd ~/Desktop/itlwm

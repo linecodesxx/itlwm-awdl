@@ -1119,9 +1119,9 @@ section 24 for detailed control-flow and ownership evidence.
 - `LogicalLink::free` calls **QueueSet vptr
   `+0x118` with null** prior to
   `setLogicalLink(nullptr)` and `release()`.
-  This virtual method must be mapped before
-  assigning teardown semantics; no direct
-  `removeEventSource` was observed.
+  **Subsequent vtable mapping confirms this is
+  `IOSkywalkQueueSet::setEnable(false)`.** It
+  disables queues but is not WorkLoop detach.
 
 This fills in the parent/child reference
 releases but still does **not** show a complete
@@ -1162,3 +1162,94 @@ is guaranteed before the subclass's memory
 is reclaimed. Inspect both without live
 registration, kext loading, or EFI changes.
 Do not publish raw KC assembly in the repo.
+
+
+
+## 25G332 vtable resolves QueueSet pre-release disable; IOEventSource free (2026-11-11)
+
+The developer ran the targeted vtable inspection and provided
+`IOEventSource::{free,setWorkLoop}` bodies from the local
+`BootKernelExtensions.kc` (Tahoe 25G332). The summarized
+evidence is recorded in
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 25. Raw KC disassembly is intentionally excluded.
+
+**Verified:**
+
+- `IOSkywalkQueueSet +0x118` =
+  `IOSkywalkQueueSet::setEnable(bool)`.
+  Therefore `IOSkywalkLogicalLink::free` calls
+  `QueueSet::setEnable(false)` for each retained
+  QueueSet **before** `setLogicalLink(nullptr)`
+  and `release()`. This is real queue disable
+  at object teardown, but not an event-source
+  removal call.
+- `IOSkywalkQueueSet +0x128` =
+  `setQueueSetId(uint64_t)`. The virtual
+  call during `QueueSet::initialize` sets an
+  ID, not a new callback source.
+- `IOSkywalkTxSubmissionQueue +0x218` =
+  `performCommand(unsigned,void*,unsigned long)`
+  at `0xffffff8002b128b6`, targeted by
+  `QueueSet::initialize`; its behavior still
+  needs inspection.
+- `IOSkywalkPacketQueue +0x1e8` =
+  `getPacketBufferPool() const`, confirming
+  pool bookkeeping in
+  `LogicalLink::setInterface`.
+- `IOEventSource::free()` at
+  `0xffffff8000acc2a0` unregisters stats,
+  optionally releases a Block callback, frees
+  statistics memory and delegates superclass
+  cleanup. **No direct WorkLoop detach or
+  callback-drain call exists in this body.**
+- `IOEventSource::setWorkLoop(nullptr)`
+  invokes the source's `disable()` virtual
+  and then nulls `eventSource+0x30`. The
+  higher-level `_maintRequest` is the known
+  synchronized event-source removal entry.
+
+**Safety interpretation:** owner-level
+`disable`, `removeEventSource`,
+`finalize` and `release/free` are
+different actions. In particular, a disabled
+event source can still be linked into a
+workloop, and a borrowed callback `refCon`
+remains unsafe to free before direct and
+workloop-driven callbacks have fully quiesced.
+
+### Next bounded read-only inspection (with cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkLogicalLink,IOSkywalkTxSubmissionQueue,IOSkywalkPacketQueue \\
+  --methods setEnable,performCommand \\
+  --max-functions 5 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-tx-command-lifecycle.txt
+
+cat /tmp/awdl-skywalk-tx-command-lifecycle.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkNetworkInterface \\
+  --methods stop,free \\
+  --max-functions 3 --max-lines 350 \\
+  --out /tmp/awdl-skywalk-network-stop.txt
+
+cat /tmp/awdl-skywalk-network-stop.txt
+```
+
+The next focus is whether `performCommand` or
+higher-level interface shutdown establishes a
+no-new-TX-callback barrier, and whether the
+owner actually detaches queues from WorkLoop.
+Absence of a direct `removeEventSource` call
+in any one method is **not proof that no
+other owner handles it**. Do not post the
+proprietary disassembly to public GitHub.
+
+No runtime kext, EFI or experimental AWDL
+registration/datapath changes are part of
+this research stage.

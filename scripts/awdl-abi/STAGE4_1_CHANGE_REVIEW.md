@@ -27,7 +27,7 @@ Base: `feature/awdl-skywalk-ax211` / `0a8f495`
 
 ## Validation status
 
-**Only source inspection and GitHub diff verification performed.** This change has **not** been built or executed on the user's macOS system. Do not install it.
+See user-reported results below. No kext was installed or executed in the kernel. Do not install it.
 
 Run on the x86_64 macOS Tahoe build machine:
 
@@ -44,3 +44,16 @@ xcodebuild -project itlwm.xcodeproj -scheme AirportItlwm-Tahoe \
 ```
 
 After an experimental build, run `WTLKcAbi/linkcheck.py` against the actual experimental `AirportItlwm.kext` and 25G332 KC. Require both builds and all ABI checks to pass before merging into the feature branch.
+
+## Local macOS verification (user-reported, 2026-11-11)
+
+The developer ran the following on their Tahoe development machine after pulling this branch:
+
+- Experimental `AirportItlwm-Tahoe` x86_64 build: **BUILD SUCCEEDED**.
+- `python3 scripts/awdl-abi/verify_datapath.py`: **ALL CHECKS PASSED**, including host C++ tests built with `-Werror`.
+- `python3 scripts/awdl-abi/verify_awdl_class.py`: **ALL CHECKS PASSED** (571 vtable entries, 0x130 instance, all 64 methods defined).
+- `python3 scripts/awdl-abi/verify_abi.py`: **ALL CHECKS PASSED**.
+- `python3 scripts/awdl-abi/verify_slots_kc.py`: **ALL SLOT CHECKS PASSED**, 63/63.
+- `WTLKcAbi/linkcheck.py` on the actual `Build/Products/Debug/Tahoe/AirportItlwm.kext`: **link check ok** against `BootKernelExtensions.kc`, 1085 unresolved imports all exported by declared bundles (corecapture 6, IO80211Family 334, IONetworkingFamily 219, IOPCIFamily 6, IOSkywalkFamily 85, kernel 435).
+
+This confirms source-level, build-time, test-time and external symbol checks; it does not validate a loaded kext or safe execution in the kernel. Runtime queue callback drain, completion/drop ownership, and concurrent teardown behavior remain open and must be reviewed before enabling registration or datapath.

@@ -902,3 +902,117 @@ submission callbacks during teardown.
 **Evidence status:** Native packet return and stored callback
 parameters are verified. A no-future-entry guarantee is
 **not** verified.
+
+
+
+## 17. IOCommandGate dispatch and detach sequencing (2026-11-11)
+
+**Evidence:** developer-uploaded local `awdl-workloop-dispatch.txt`
+for Tahoe 25G332, containing vtable mappings and method disassembly
+for `IOCommandGate::{runAction,runCommand,setWorkLoop}`,
+`IOWorkLoop::{runAction,removeEventSource}`, and
+`IOEventSource::setWorkLoop`. The interpretation below does not
+redistribute proprietary KC instructions.
+
+### 17.1 Workloop's internal +0x20 target: command gate dispatch
+
+- `IOCommandGate` vptr `+0x1c0` is
+  `IOCommandGate::runCommand(void*,void*,void*,void*)`,
+  at `0xffffff8000ace050`.
+- `IOWorkLoop::removeEventSource` delegates to
+  `*(workloop+0x20)` vptr `+0x1c0`, with the first
+  command argument set to **1** and the event source as
+  another argument. Together with the vtable result,
+  this is consistent with `workloop+0x20` being its
+  internal command gate (the object's concrete dynamic
+  class was not separately proven).
+- `IOCommandGate::runCommand` is a **12-instruction
+  forwarding wrapper**: rearranges registers, loads
+  `gate+0x20` as the owner, and tail-calls
+  `gate->vptr+0x1c8`. **That vtable target is currently
+  unnamed and its body uninspected.** It may supply the
+  command execution/serialization implementation, so do
+  not assert a successful detach solely from this wrapper.
+- The `IOWorkLoop` class itself has a reserved symbol
+  at vptr `+0x1c0`; that is *not* the callback target
+  of the `IOCommandGate` object at `workloop+0x20`.
+
+### 17.2 Gate synchronization mechanisms do exist
+
+`IOCommandGate::runAction` at
+`0xffffff8000ace080`:
+
+- Rejects a null action and handles a missing workloop.
+- Uses workloop virtual calls `+0x180`, `+0x130`
+  for gate entry / current-gate-state checks; when not
+  immediately in gate, the method can sleep using
+  workloop vptr `+0x190` and later wake through
+  vptr `+0x198`.
+- Calls the action pointer while in the gated path,
+  then leaves using workloop vptr `+0x178`.
+- Maintains a gate-related state word at
+  `IOCommandGate+0x48`. A teardown branch can call
+  the event source's vptr `+0x158`, clear its
+  workloop pointer `+0x30` and then leave the gate.
+
+`IOWorkLoop::runAction` at
+`0xffffff8000acb5f0` similarly enters and exits
+its gate around the supplied function pointer.
+
+**Interpretation limit:** this proves that the underlying
+IOKit framework contains synchronous gate execution and
+waiting mechanisms. It does **not** prove that
+`IOWorkLoop::removeEventSource` uses precisely the
+`runAction` path on this build until the gate's
+virtual `+0x1c8` is resolved and inspected.
+
+### 17.3 Event source and command gate detach
+
+- `IOEventSource::setWorkLoop(nullptr)` at
+  `0xffffff8000acc390` invokes the event source's
+  virtual `+0x158` before clearing `source+0x30`.
+  The earlier Skywalk queue vtable mapping identifies
+  its own `+0x158` as `disable()`. Confirm the
+  relevant IOEventSource/IOCommandGate slot separately
+  before generalizing to every subclass.
+- `IOCommandGate::setWorkLoop(nullptr)` at
+  `0xffffff8000acddf0` enters the former workloop's
+  gate, marks an internal detach flag at `gate+0x48`,
+  and may wait with `IOEventSource::sleepGate` while
+  a state bit remains set, then disables/clears its
+  workloop pointer on a suitable path. It eventually
+  exits the workloop gate.
+- The shown `IOCommandGate::setWorkLoop(nullptr)`
+  body does **not** establish that the owner's Skywalk
+  submission callback will never be called directly
+  from another thread.
+
+### 17.4 Safety consequence
+
+The new evidence makes a **synchronous detach protocol
+plausible** but does not establish its complete preconditions
+or that the proprietary Skywalk queue owner calls it before
+releasing the borrowed `refCon`.
+
+The exact remaining questions:
+
+1. Resolve `IOCommandGate` virtual `+0x1c8`,
+   and all gate/workloop slot names `+0x130`,
+   `+0x158`, `+0x178`, `+0x180`,
+   `+0x190`, `+0x198`.
+2. Inspect the actual `+0x1c8` operation handler
+   and determine whether removal occurs under gate,
+   how it handles current/pending work, and its return
+   semantics.
+3. Find the higher-level caller of
+   `IOWorkLoop::removeEventSource(queue)` in
+   the relevant owner-side queue teardown.
+4. Independently rule out **direct** callers of
+   `packetSubmission` / `legacyDequeue` after
+   detach; then drain admitted callbacks before
+   freeing `SkywalkBackend::txCallbackContext_`.
+
+`ITLWM_AWDL_DATAPATH_LIVE=0` and
+`ITLWM_AWDL_REGISTRATION_ENABLED=0` remain hard gates.
+No native driver, kext, EFI or hardware changes are
+justified by the current analysis.

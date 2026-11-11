@@ -2257,12 +2257,11 @@ This report records only interpreted control flow.
   `packetSubmission`, or an explicit queue
   callback barrier.
 
-**Do not label virtual +0x930 until it has been
-resolved in the actual `IOSkywalkNetworkInterface`
-vtable.** The next research question is whether
-it invokes `LogicalLink::setEnable`/
-`QueueSet::setEnable` or another higher-level
-network enable transition.
+**Updated by 25G332 vtable evidence (section 28):**
+virtual `+0x930` is confirmed as
+`IOSkywalkNetworkInterface::setInterfaceEnable(bool)`.
+Its body still needs inspection to identify any
+`LogicalLink::setEnable`/`QueueSet::setEnable` cascade.
 
 ### 27.2 NetworkInterface disable uses atomic state transition
 
@@ -2312,17 +2311,14 @@ These are more specific next candidates
 for the queue attachment/teardown contract
 than a generic superclass stop symbol.
 
-**Important correction to section 26.3:**
+**Important correction to section 26.3, now resolved:**
 `IOSkywalkNetworkInterface::stop` tail-calls
-a raw `IOSkywalkInterface` *base vtable
-entry `__ZTV+0x5d8`*, corresponding to
-object-vptr `+0x5c8`. No
-`IOSkywalkInterface::stop` override appears
-in this local symbol inventory, so the
-actual function could be inherited from a
-superclass. Its identity must be resolved
-from the local vtable instead of inferred
-from the class whose table is referenced.
+raw `IOSkywalkInterface` base vtable entry
+`__ZTV+0x5d8`, i.e. object-vptr `+0x5c8`.
+The subsequent local vtable lookup maps this
+entry to **`IOService::stop(IOService*)`** at
+`0xffffff8000a94e80`, not to an
+`IOSkywalkInterface::stop` override.
 
 ### 27.4 Next bounded evidence
 
@@ -2344,3 +2340,175 @@ Keep the 25G332 research read-only:
 `ITLWM_AWDL_DATAPATH_LIVE=0`. No kext
 installation, native queue registration,
 EFI, or runtime-code changes.
+
+
+
+## 28. IOSkywalkInterface queue-array retention and actual enable/stop dispatch (2026-11-11)
+
+**Source:** developer-provided Tahoe 25G332 KC vtable results
+and disassembly of
+`IOSkywalkInterface::{registerInterfaceWithQueues,
+deregisterInterfaceWithQueues,free}`.
+This report includes only interpretation, not copied
+proprietary assembly.
+
+### 28.1 Previously unresolved interface vptrs are named
+
+Local vtable inspection identifies:
+
+- `IOSkywalkNetworkInterface` object-vptr `+0x930` =
+  **`IOSkywalkNetworkInterface::setInterfaceEnable(bool)`**
+  at `0xffffff8002b10558`. Therefore the
+  `NetworkInterface::{enable,disable}` bodies
+  call this concrete method. Its implementation
+  has not yet been disassembled.
+- `IOSkywalkInterface` object-vptr `+0x5c8` =
+  **`IOService::stop(IOService*)`** at
+  `0xffffff8000a94e80`. This resolves
+  the inherited stop target used by
+  `IOSkywalkNetworkInterface::stop` after
+  `deregisterNetworkInterface()`.
+  Do not confuse this with the concrete
+  `IOSkywalkNetworkInterface+0x5c8` target,
+  which points to the network-class override
+  `IOSkywalkNetworkInterface::stop`.
+
+These names confirm dispatch identity, **not**
+implicit event-source removal or callback drain.
+
+### 28.2 Separate IOSkywalkInterface register-with-queues API
+
+`IOSkywalkInterface::registerInterfaceWithQueues` at
+`0xffffff8002b00d0c`:
+
+1. Validates non-null queue array and count `>= 2`,
+   and at least one non-null pool argument; otherwise
+   returns `0xe00002c2`.
+2. Creates an `OSArray::withObjects(queueArray,count,...)`
+   holding references to the supplied queues.
+3. Atomically compares/exchanges a null into
+   `interface+0x90` to install this newly created
+   array, rejecting an already registered array
+   with `0xe00002c5`. Failed installation
+   releases the temporary OSArray.
+4. On successful install, calls
+   `IOSkywalkPacketQueue::setInterface(interface)`
+   for each queue pointer. The implementation
+   of that setter has not yet been inspected.
+5. Chooses two pool arguments (substituting
+   the one supplied pool when only one is
+   present), stores them at
+   `interface+0x98/+0xa0` and performs the
+   corresponding reference retains. Note that
+   both fields may refer to the same pool,
+   and reference accounting must be read in
+   terms of *each stored reference*.
+
+**No direct WorkLoop `addEventSource` call was
+observed in this routine.** The array and
+`queue->setInterface` calls establish an
+ownership/association path for this
+`IOSkywalkInterface` API. Do **not** assume
+this API is the same call path as the
+separately inspected
+`IOSkywalkNetworkInterface::registerNetworkInterface`
+with LogicalLink/QueueSet; exact callers
+have not been compared.
+
+### 28.3 Deregistration removes the reference container
+
+`IOSkywalkInterface::deregisterInterfaceWithQueues()`
+at `0xffffff8002b00b9c`:
+
+- Atomically exchanges `interface+0x90`
+  with null. When it was absent, returns
+  `0xe00002f0`.
+- On a non-null former OSArray, releases it
+  (and hence its retained queue references
+  according to OSArray ownership).
+- Releases and nulls pools at
+  `interface+0x98/+0xa0`, and returns zero.
+
+The shown implementation has **no explicit**
+per-queue `disable`, `finalize`,
+`setInterface(nullptr)`, `removeEventSource`
+or callback drain; it also does not iterate
+through each original queue to clear its
+interface pointer. Some side effects could
+belong to `IOSkywalkPacketQueue::setInterface`,
+prior owner shutdown, caller ordering, or
+other lifecycle APIs. From this routine
+alone, one cannot conclude that Apple
+has a teardown bug, or that the borrowed
+`TxCallbackContext` is safe.
+
+### 28.4 Base free invokes deregistration, not explicit detach
+
+`IOSkywalkInterface::free()` at
+`0xffffff8002b00b14` calls its own
+`deregisterInterfaceWithQueues()` and
+then frees an auxiliary private structure
+at `interface+0xa8`:
+an owned lock, an owned object reference and
+the typed allocation. It finally delegates
+to superclass `free()`.
+
+The body does not call
+`IOWorkLoop::removeEventSource`, explicitly
+drain outstanding queue callbacks or clear
+all queue `refCon` data. The inherited
+superclass implementation has not been traced
+here. As usual, `release` may trigger
+destruction **if** it consumes the final
+reference, so it is not a substitute for an
+owner-specified quiescence barrier.
+
+### 28.5 Implications and next exact inspection
+
+```text
+IOSkywalkInterface::registerInterfaceWithQueues
+  -> OSArray holds IOSkywalkPacketQueue references
+  -> queue->setInterface(this)
+  -> two pool reference slots
+
+IOSkywalkInterface::deregisterInterfaceWithQueues
+  -> atomic unlink of OSArray
+  -> OSArray release (queue ref releases)
+  -> pool ref releases
+
+IOSkywalkNetworkInterface::{enable,disable}
+  -> concrete setInterfaceEnable(bool)
+  -> remaining behavior NOT YET INSPECTED
+```
+
+A successful WorkLoop remove already has a
+well-evidenced synchronous boundary for
+WorkLoop-driven callbacks, but this
+`IOSkywalkInterface` registration/deregistration
+API does **not** itself show that boundary,
+and does not rule out *direct* TX
+`packetSubmission` users after removal.
+
+**Next bounded targets:**
+
+- Disassemble
+  `IOSkywalkNetworkInterface::setInterfaceEnable`
+  (actual vptr `+0x930`) to see whether
+  it cascades to `LogicalLink::setEnable`,
+  changes producers, or invokes workloop detach.
+- Disassemble
+  `IOSkywalkPacketQueue::setInterface`
+  to verify whether queue->interface association
+  is a simple pointer store or manages lifetime.
+- Optionally inspect
+  `IOSkywalkInterface::{willTerminate,didTerminate,
+  handleClose}` for higher-level ordering.
+- Then trace the **actual owner-side**
+  `addEventSource/removeEventSource`
+  invocations and all non-workloop TX
+  submissions, preserving the strict
+  borrowed-`refCon` lifetime requirement.
+
+Guardrails: `ITLWM_AWDL_REGISTRATION_ENABLED=0`,
+`ITLWM_AWDL_DATAPATH_LIVE=0`, no kext
+loading, EFI modification or live AWDL traffic.

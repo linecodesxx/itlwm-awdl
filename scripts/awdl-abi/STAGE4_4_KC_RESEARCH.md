@@ -1253,3 +1253,89 @@ proprietary disassembly to public GitHub.
 No runtime kext, EFI or experimental AWDL
 registration/datapath changes are part of
 this research stage.
+
+
+
+## TX performCommand and interface stop/free inspection (2026-11-11)
+
+The developer supplied local 25G332 KC disassembly
+from `awdl-skywalk-tx-command-lifecycle.txt`
+and `awdl-skywalk-network-stop.txt` for
+`IOSkywalkLogicalLink::setEnable`,
+`IOSkywalkTxSubmissionQueue::performCommand`,
+base `IOSkywalkPacketQueue::performCommand`,
+and `IOSkywalkNetworkInterface::{stop,free}`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 26.
+
+**Verified:**
+
+- `LogicalLink::setEnable(bool)` iterates
+  its QueueSets, invokes each `setEnable(bool)`,
+  and exits early on a nonzero status;
+  empty collections return `0xe00002bc`.
+  `QueueSet::setEnable` itself returns zero
+  without monitoring every queue's transition.
+- `TxSubmissionQueue::performCommand` dispatches
+  configuration and query commands via a jump table.
+  Visible branches access capacity/pool info,
+  connection/flag fields, and `addReporters`;
+  unhandled commands fall through to base
+  `performCommand` (`0xe00002c7`).
+  No direct workloop detach or TX callback drain
+  is seen. The exact semantics of the
+  `QueueSet::initialize` command `0x50000`
+  are **not** established solely from this output.
+- `NetworkInterface::stop` conditionally
+  calls `deregisterNetworkInterface`, then
+  delegates to `IOSkywalkInterface::stop`.
+- `NetworkInterface::free` calls deregistration
+  then cancels and frees a private thread call,
+  frees locks, releases a private object and
+  delegates to superclass `free`.
+  **Cancellation is not automatically a proof
+  of running callbacks being quiescent.**
+  This private thread call has not been linked
+  to the AWDL TX callback path.
+
+**Safety status:** still no documented owner-side
+queue `removeEventSource` call or independent
+barrier preventing all future direct
+`packetSubmission` entries. Freeing the
+backend's borrowed callback context would remain
+unsafe without those proofs. Do not enable
+experimental registration/datapath.
+
+### Next read-only superclass and network-enable inventory
+
+The collector now includes the `IOSkywalkInterface`
+superclass for targeted named-method collection.
+Run the following, keeping the outputs local:
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkInterface \\
+  --all-methods --list-only \\
+  > /tmp/awdl-skywalk-interface-base-methods.txt
+
+cat /tmp/awdl-skywalk-interface-base-methods.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkNetworkInterface \\
+  --methods enable,disable \\
+  --max-functions 4 --max-lines 400 \\
+  --out /tmp/awdl-skywalk-network-enable-disable.txt
+
+cat /tmp/awdl-skywalk-network-enable-disable.txt
+```
+
+The inventory lets us choose exact superclass lifecycle
+methods on the next pass. The second command checks whether
+enable/disable directly interact with WorkLoop registration
+or hand off to other owner objects. If not, another
+reverse-caller investigation will be required.
+Do not commit raw KC disassembly or make any
+kext/EFI/runtime changes.

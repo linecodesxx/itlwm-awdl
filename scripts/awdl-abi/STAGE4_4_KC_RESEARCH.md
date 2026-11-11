@@ -273,3 +273,59 @@ callback quiescence, TX/RX ownership, packet recycling and teardown.
 The presence of `finalize()` does not itself prove draining or
 safe deletion of a callback context. No runtime gates or driver source
 were changed.
+
+
+## Full packet-lifetime and finalize review (developer-uploaded, 2026-11-11)
+
+Both previously requested evidence files are now available and reviewed:
+`awdl-skywalk-packet-lifetime.txt` and `awdl-skywalk-finalize.txt`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md), section 11,
+for the evidence-based control-flow analysis.
+
+**Confirmed behavior:**
+
+- `deallocatePacket` tail-calls `_kern_pbufpool_free`.
+  `deallocatePackets` changes the passed pointer array from wrapper
+  pointers into native handles before calling `_kern_pbufpool_free_batch`.
+- `completeWithQueue` invokes `_kern_packet_finalize` in mode 2;
+  `disposePacket` disposes buffers and clears the wrapper's native handle
+  without itself returning that handle through `_kern_pbufpool_free`.
+- Base `IOSkywalkPacketQueue::finalize` decrements the field at `+0xbc`,
+  invokes a still-unidentified virtual at `+0x18`, optionally calls pool
+  `checkOutPacketQueue`, and returns `0xe00002d5` when the tracked count
+  remains nonzero.
+- `TxCompletionQueue::finalize` treats base `0xe00002d5` as a successful
+  return **without** resetting its completion state. Its `free()` calls
+  this finalize before freeing memory, but that alone is **not** evidence
+  of callback quiescence.
+- `TxSubmissionQueue::finalize` calls vptr `+0x2a0` on base success;
+  `RxCompletionQueue::finalize` calls
+  `IOSkywalkPacketTable::flushAllPackets` on base success.
+- All specialized finalize wrappers reopen the `IOEventSource` gate.
+  No proven no-future-callback lifetime boundary has been found.
+
+**Consequence:** native TX pool return is directly evidenced, but the
+safety condition for releasing the embedded `TxCallbackContext` is **still
+not verified**. This is not permission to enable AWDL or reuse the host-only
+ownership ledger in a live kernel packet path.
+
+### Next read-only evidence
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOSkywalkPacketQueue,IOSkywalkTxSubmissionQueue,IOSkywalkPacket,IOSkywalkPacketBuffer \\
+  --offsets 0x18,0x148,0x1a0,0x2a0
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --methods checkOutPacketQueue,flushAllPackets,disposePacketBuffer \\
+  --max-functions 12 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-next-lifetime.txt
+```
+
+Send the printed vtable mapping and the new local text file for review.
+The evidence should remain outside public GitHub.
+
+**No production kext files changed; experimental gates stay off.**

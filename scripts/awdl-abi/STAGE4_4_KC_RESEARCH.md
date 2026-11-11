@@ -658,3 +658,59 @@ After this lookup identifies `IOCommandGate+0x1c8`, use the
 read-only collector to inspect the **exact identified method**.
 Do not infer that `removeEventSource` is already a proven
 no-future-callback barrier. No kext/EFI/runtime flag changes.
+
+
+
+## Workloop command action confirmed (2026-11-11)
+
+The developer's Tahoe 25G332 vtable mapping established
+`IOCommandGate::runAction` at object-vptr `+0x1c8`.
+This completes the previously unnamed command-gate dispatch:
+
+```text
+IOWorkLoop::removeEventSource(queue)
+  -> IOCommandGate::runCommand(operation=1,queue)
+  -> IOCommandGate::runAction(action=gate+0x20,...)
+  -> saved action called under workloop gate
+```
+
+A prior report erroneously described `gate+0x20` as
+the owner; **correction:** it is the action pointer,
+while `gate+0x18` is the owner. See
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md)
+section 18.
+
+The public Apple XNU `IOWorkLoop.cpp` initializes
+the internal command-gate action with
+`IOWorkLoop::_maintRequest`, whose removal case
+unlinks an event source, clears its workloop/next
+pointers and releases a retained reference.
+
+https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOWorkLoop.cpp
+
+This is **public-source corroboration, not verification
+against the exact 25G332 KC**. The developer should now
+inspect the KC's actual `IOWorkLoop::_maintRequest` to
+validate that behavior.
+
+### Next read-only evidence (with cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOWorkLoop \\
+  --methods _maintRequest,init,runEventSources \\
+  --max-functions 6 --max-lines 420 \\
+  --out /tmp/awdl-workloop-maintenance.txt
+
+cat /tmp/awdl-workloop-maintenance.txt
+```
+
+The exact `_maintRequest` function may be absent from
+exported KC symbols, in which case report the method
+list and proceed with a targeted vtable/function-reference
+investigation instead of assuming its behavior. No
+live AWDL, EFI changes or kext installation is permitted
+by this evidence.

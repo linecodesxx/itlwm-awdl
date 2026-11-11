@@ -1000,3 +1000,82 @@ be initiated after that operation.
 
 Runtime AWDL registration and datapath remain
 disabled, with no kext or EFI modifications.
+
+
+
+## QueueSet -> LogicalLink ownership and interface cleanup (2026-11-11)
+
+The developer uploaded local 25G332 disassembly
+`awdl-skywalk-queueset-lifecycle.txt` and
+`awdl-skywalk-interface-registration.txt`.
+The first captured only `IOSkywalkQueueSet::initWithQueues`
+plus five non-code `kalloc_type_view` symbols because
+`--max-functions 6` was exhausted early. **We have
+not yet inspected QueueSet `initialize`,
+`setEnable` or `finalize`.** The second report
+contains both NetworkInterface registration
+overloads and deregistration.
+
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md)
+section 23 for grounded control flow.
+
+- `QueueSet::initWithQueues` groups queues by type,
+  stores their pointers in categorized and overall
+  arrays, calls `queue->setQueueSet(this)`, and
+  **retains each queue**. This is positive
+  QueueSet-side ownership evidence.
+- The `registerNetworkInterface` overload accepting
+  a queue array constructs a `QueueSet`, wraps it
+  in a `LogicalLink` and passes the result to
+  another registration overload.
+- The `LogicalLink*` registration overload
+  configures a default logical link and retains
+  packet-buffer pool references.
+- `deregisterNetworkInterface` releases links,
+  pool and metadata references and removes
+  relevant steering rules, but the displayed
+  body has **no direct call** to
+  `removeEventSource`. That does not rule
+  out detach in the child object's teardown.
+- The collector previously included function-local
+  statics like `kalloc_type_view`, masking
+  real target methods under `--max-functions`.
+  It now excludes `__ZZN...` symbols, retains
+  `__ZN...` / `__ZNK...` methods and supports
+  `IOSkywalkLogicalLink`.
+
+### Next exact bounded evidence (with cat for both)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkQueueSet \\
+  --methods initialize,setEnable,finalize,free \\
+  --max-functions 8 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-queueset-teardown.txt
+
+cat /tmp/awdl-skywalk-queueset-teardown.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkLogicalLink \\
+  --methods initialize,setInterface,finalize,free \\
+  --max-functions 8 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-logical-link-teardown.txt
+
+cat /tmp/awdl-skywalk-logical-link-teardown.txt
+```
+
+If a requested method does not exist in this
+KC, the collector will only show the available
+matches. The next question is whether any
+`QueueSet/LogicalLink` teardown method actually
+detaches a TX event source, drains callbacks,
+and releases it in a proven order. Until that
+and direct TX entry paths are established, the
+embedded `TxCallbackContext` remains unsafe
+to destroy on a merely disabled queue.
+
+All experiments remain read-only; AWDL runtime
+registration and packet datapath stay disabled.

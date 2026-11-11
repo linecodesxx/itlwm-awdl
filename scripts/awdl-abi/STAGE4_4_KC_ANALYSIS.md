@@ -1473,3 +1473,139 @@ to detach before destruction* and the
 blocking lifecycle gaps. Keep
 `ITLWM_AWDL_DATAPATH_LIVE=0` and
 `ITLWM_AWDL_REGISTRATION_ENABLED=0`.
+
+
+
+## 22. TX withPool/free and owner method inventory (2026-11-11)
+
+**Source:** developer's local Tahoe 25G332 KC results from
+`awdl-skywalk-owner-methods.txt` and
+`awdl-skywalk-base-enable-free.txt`. The former is a
+method-symbol inventory (171 matches before correction of the
+collector's overbroad class-match filter), and the latter
+contains the bodies of TX `enable()`, TX/base `free()`
+and three TX `withPool()` overloads. No raw KC code
+is committed to this public research repository.
+
+### 22.1 Queue destruction has no explicit local detach or drain
+
+`IOSkywalkTxSubmissionQueue::free()` at
+`0xffffff8002b11be2`:
+
+1. Destroys and frees the `IOSkywalkPacketTable*`
+   at `queue+0xe8`, then sets this field to null.
+2. Frees the statistics block at `queue+0x100`
+   and the optional ABFS block at `queue+0x68`,
+   nulling each pointer.
+3. Tail-calls the inherited
+   `IOSkywalkPacketQueue::free()` via the
+   **raw base vtable `__ZTV+0xa0`**.
+
+`IOSkywalkPacketQueue::free()` at
+`0xffffff8002b0dc8e`:
+
+1. Clears wrapper metadata fields `queue+0x70`
+   and `queue+0x60`.
+2. Releases the pool object at `queue+0x50`,
+   if present, and zeros that field.
+3. Tail-calls the superclass `free()` via
+   a separate superclass vtable.
+
+There are **no explicit calls in either body** to
+`IOWorkLoop::removeEventSource`, `finalize`,
+`purgePackets`, or a callback-drain barrier.
+This does **not** demonstrate that the inherited
+`IOEventSource::free` or the owner never handle
+teardown: those are separate code paths that
+must be checked. In particular, freeing an
+allocated TX packet table should only follow
+an independently established safe packet
+cleanup and callback-detach sequence.
+
+### 22.2 Three overloads of TX withPool
+
+- The shorter `withPool(pool, ..., owner,
+  packetAction, refCon, flags)` at
+  `0xffffff8002b11a86` forwards into the
+  full-argument allocator with no optional
+  budget callback and a sentinel argument.
+- The full allocator at `0xffffff8002b119b4`
+  constructs a `IOSkywalkTxSubmissionQueue`
+  object of size **`0x168` bytes**, dispatches
+  virtual `initWithPool` at vptr `+0x2a8`,
+  returns it if init succeeds, otherwise calls
+  virtual `release` at `+0x28` and returns
+  null.
+- The overload taking `IOSkywalkPacket**`
+  at `0xffffff8002b11a62` sets option bit
+  `0x8` and forwards to the full allocator.
+  This is an overload/flag distinction;
+  packet-array ownership semantics still
+  require checking the consumer.
+
+The shown `withPool` implementations do not
+attach the newly constructed queue as a
+workloop event source. A higher-level owner
+must perform that attachment if the queue is
+to receive WorkLoop-driven events.
+
+### 22.3 Concrete owner-side method candidates
+
+The local symbol inventory directly exposes:
+
+- `IOSkywalkNetworkInterface::registerNetworkInterface`
+  overloads at `0xffffff8002b0f204` and
+  `0xffffff8002b0f0d6`.
+- `IOSkywalkNetworkInterface::deregisterNetworkInterface`
+  at `0xffffff8002b0ee9c`, `stop` at
+  `0xffffff8002b0ee66`, and `free` at
+  `0xffffff8002b0effe`.
+- `IOSkywalkQueueSet::initWithQueues`
+  at `0xffffff8002b18406`,
+  `initialize` at `0xffffff8002b18a22`,
+  `finalize` at `0xffffff8002b18afa`,
+  `setEnable` at `0xffffff8002b189ce`,
+  and `free` at `0xffffff8002b18846`.
+
+These are *candidate owner-side control paths*,
+not yet verified callers of
+`IOWorkLoop::addEventSource` or
+`removeEventSource`.
+
+### 22.4 Collector inventory precision
+
+The previous `--list-only --all-methods`
+inventory reported 171 matches. The collector
+had an overbroad `f + "::" in decoded` class
+check; this admitted unrelated methods
+whose **argument types** mentioned a selected
+class, e.g. `AppleEthernetRL::getTSOOptions`
+with an `IOSkywalkNetworkInterface::IOSkywalkTSOOptions*`
+argument. This is not evidence the unrelated method
+belongs to `IOSkywalkNetworkInterface`.
+
+The collector has been corrected to match the
+demangled function's **leading qualified owner**
+when selecting classes. Nested class members
+(e.g. `IOSkywalkNetworkInterface::MetaClass::...`)
+remain part of that class-family inventory,
+so an inventory count is not a count of
+runtime queue owner entry points.
+
+### 22.5 Remaining safety invariant
+
+The directly observed `withPool -> initWithPool`
+and `free -> base free` paths provide object
+allocation and destruction mechanics but
+do **not** implement the required
+`stop external producers -> disable ->
+detach from workloop -> drain callbacks and
+packets -> release` ordering.
+
+The next bounded read-only analysis must
+inspect `IOSkywalkQueueSet` enable/finalize/free,
+`IOSkywalkNetworkInterface` register/deregister,
+and `IOEventSource::free`, without claiming
+to know their call graph from names alone.
+Keep `ITLWM_AWDL_REGISTRATION_ENABLED=0`
+and `ITLWM_AWDL_DATAPATH_LIVE=0`.

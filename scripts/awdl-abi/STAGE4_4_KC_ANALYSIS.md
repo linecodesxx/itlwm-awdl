@@ -353,3 +353,16 @@ serialization/detach **before** calling `free()`.
 confirmed in the local 25G332 KC, and queue finalize semantics are more
 complex than a simple drain. The key no-future-callback lifetime
 invariant remains unverified. Do not install or load experimental AWDL.
+
+
+## 11. Packet and queue finalize behavior verified from uploaded source
+
+The full `awdl-skywalk-packet-lifetime.txt` and `awdl-skywalk-finalize.txt` were reviewed. Detailed analysis: [STAGE4_4_PACKET_FINALIZE_REVIEW.md](STAGE4_4_PACKET_FINALIZE_REVIEW.md). Key findings:
+
+- `deallocatePacket(s)` invokes native `_kern_pbufpool_free(_batch)` after wrapper disposal. The batch form **mutates its incoming packet-pointer array** into native packet handles before freeing.
+- `IOSkywalkPacket::completeWithQueue` contains a mode-2 `_kern_packet_finalize` path and invokes additional unknown buffer and packet vtable methods; wrapper `disposePacket` alone does not free the native packet.
+- `IOSkywalkPacketQueue::finalize` manages state/counter `+0xbc` and optionally calls pool `checkOutPacketQueue`. This counter is **not proven to count in-flight callbacks**.
+- Specialized `TxCompletionQueue::finalize` maps base code `0xe00002d5` to success **without its normal field-clearing branch**. In the earlier disassembly, `TxCompletionQueue::free` ignores `finalize`'s return value and frees support buffers regardless. No callback quiescence guarantee is established.
+- `RxCompletionQueue::finalize` invokes `IOSkywalkPacketTable::flushAllPackets` after base success; internals remain to be examined.
+
+No live TX/RX, AWDL interface registration, or callback lifetime change is authorized.

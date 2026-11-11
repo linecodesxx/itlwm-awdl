@@ -609,3 +609,52 @@ Do not equate a vtable match on the wrong class with its runtime
 target, and do not publish raw KC disassembly.
 
 No kernel C++ sources, kext runtime flags or EFI are modified.
+
+
+
+## IOCommandGate handler and detachment review (2026-11-11)
+
+The user supplied the local `awdl-workloop-dispatch.txt` containing
+`IOCommandGate::{runAction,runCommand,setWorkLoop}`,
+`IOWorkLoop::{runAction,removeEventSource}` and
+`IOEventSource::setWorkLoop`. See
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md), section 17.
+
+**Verified:**
+
+- The `IOCommandGate` vptr slot `+0x1c0` is
+  `runCommand(...)`, used by `IOWorkLoop::removeEventSource`
+  via its internal `workloop+0x20` object. This is
+  strong evidence that removal is delegated to the
+  internal command gate.
+- `runCommand` is a thin forwarding wrapper to
+  `gate->vptr+0x1c8`, **not** the removal implementation itself.
+  The `+0x1c8` target remains unidentified.
+- `IOCommandGate::runAction` and
+  `IOWorkLoop::runAction` contain workloop gate
+  enter/leave logic. `IOCommandGate::setWorkLoop(nullptr)`
+  can sleep/wait while detaching its workloop.
+- `IOEventSource::setWorkLoop(nullptr)` calls an event-source
+  virtual at `+0x158` and clears the stored workloop pointer.
+  The gate synchronization does **not automatically establish**
+  safe lifetime for external direct TX callbacks or their
+  borrowed `refCon`.
+
+**Next, read-only vtable lookup (show through cat):**
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOCommandGate,IOWorkLoop,IOEventSource \\
+  --offsets 0x130,0x158,0x178,0x180,0x190,0x198,0x1c8 \\
+  > /tmp/awdl-workloop-vptr.txt
+
+cat /tmp/awdl-workloop-vptr.txt
+```
+
+After this lookup identifies `IOCommandGate+0x1c8`, use the
+read-only collector to inspect the **exact identified method**.
+Do not infer that `removeEventSource` is already a proven
+no-future-callback barrier. No kext/EFI/runtime flag changes.

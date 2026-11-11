@@ -3036,3 +3036,151 @@ context is destroyed. Keep
 `ITLWM_AWDL_REGISTRATION_ENABLED=0`
 and `ITLWM_AWDL_DATAPATH_LIVE=0`;
 do not change runtime, EFI, or live kexts.
+
+
+
+## 33. Exhaustive selected-owner scan and typed receiver candidates (2026-11-11)
+
+**Source:** developer-supplied local Tahoe 25G332 interpreted
+`scan_skywalk_direct_calls.py` reports for (1) the selected
+owner-class families and (2) ranked general symbolic
+function indices `[540,720)`. The logs contain
+symbolic caller addresses and candidate vptr
+offsets only, not proprietary disassembly.
+
+### 33.1 Exhaustive owner-class scan, 420/420
+
+The targeted scan used exactly these class-prefix families:
+
+```text
+IOSkywalkNetworkInterface, IOSkywalkInterface,
+IOSkywalkQueueSet, IOSkywalkLogicalLink,
+IOSkywalkTxSubmissionQueue, IOSkywalkPacketQueue,
+IOSkywalkPacketBufferPool
+```
+
+It scanned **420/420 distinct resolved symbolic function
+addresses** with `--max-lines 500`, zero disassembly
+failures, zero truncated bodies, zero direct
+`call/jmp` hits to the exact hardcoded
+`IOWorkLoop::{add,remove}EventSource` and
+`IOSkywalkTxSubmissionQueue::packetSubmission(bool)`
+entry addresses.
+
+There were **30 candidate indirect call/jmp sites**
+using one of the requested offsets
+`+0x140,+0x148,+0x1d8`. Their presence
+is expected in this region because these are
+generic C++ vptr slot offsets, heavily reused
+across unrelated object types. **Zero direct hits
+is not a proof of absent virtual callers.**
+
+Several method bodies are immediately relevant:
+
+| Symbol owner / method | Symbol address | Call site | Offset | Interpretation |
+|---|---|---|---|---|
+| `IOSkywalkTxSubmissionQueue::enable` | `0xffffff8002b11c76` | `0xffffff8002b11cb2` | `+0x1d8` | Prior section 21 disassembly and TX vtable establish this method can invoke `packetSubmission(bool)` on its TX queue. This is a *typed* path, not evidence of WorkLoop attach. |
+| `IOSkywalkNetworkInterface::removeSteeringRule` | `0xffffff8002b0f43a` | `0xffffff8002b0f514` | `+0x148` | Receiver type not yet checked; **not** verified WorkLoop `removeEventSource`. |
+| `IOSkywalkTxSubmissionQueue::packetSubmission(uint64_t*,uint*,uint*)` | `0xffffff8002b31b2a` | `0xffffff8002b31d12` | `+0x140` | Receiver type unresolved; distinct from `packetSubmission(bool)` overload. |
+| `IOSkywalkTxSubmissionQueue::getPacketListForKPipe` | `0xffffff8002b12164` | `0xffffff8002b12292` | `+0x140` | Unresolved receiver. |
+| `IOSkywalkTxSubmissionQueue::getPacketListForNetworking` | `0xffffff8002b1257c` | `0xffffff8002b1267a` | `+0x140` | Unresolved receiver. |
+| `IOSkywalkTxSubmissionQueue::refillTxRingForKPipe` | `0xffffff8002b11fb6` | `0xffffff8002b120de` | `+0x140` | Unresolved receiver. |
+| `IOSkywalkTxSubmissionQueue::refillTxRingForNetworking` | `0xffffff8002b123e0` | `0xffffff8002b124e7` | `+0x140` | Unresolved receiver. |
+| `IOSkywalkTxSubmissionQueue::purgePackets (.cold.1)` | `0xffffff8002b32015` | `0xffffff8002b3206b` | `+0x140` | Unresolved receiver. |
+| `IOSkywalkPacketBufferPool::checkOutPacketQueue` | `0xffffff8002b0ab92` | `0xffffff8002b0abc4`, `0xffffff8002b0ac2f` | `+0x1d8` | Could be pool/OSSet bookkeeping; do **not** infer TX submission. |
+
+Additional candidate virtual calls of interest:
+`IOSkywalkTxSubmissionQueue::{requestDequeue,checkForWork,
+getPacketListForKPipe,getPacketListForNetworking,
+refillTxRingForKPipe,refillTxRingForNetworking}`
+at `+0x1d8`, but unlike `enable()` each
+caller must be type-traced individually before
+attributing a queue `packetSubmission(bool)` call.
+The scan also captured pool reporter/packet
+allocation virtuals at these reused offsets.
+
+**Selected class coverage is exhaustive within this
+script's symbol selection and per-function line cap,
+not exhaustive across all loaded driver code.**
+The search omits anonymous functions, other
+class families and symbol bodies not indexed by KC,
+and recognizes only two instruction text patterns
+for indirect candidates.
+
+### 33.2 Next general ranked slice [540,720)
+
+The independent general scan using
+`IOSkywalk,IOUserNetwork,IOEthernet` prefixes
+and exact indirect offsets `+0x140,+0x148`
+found:
+
+- 180/180 selected functions in `[540,720)`
+  of 2353, 0 direct hits, 0 errors and 0 truncated.
+- Four candidate indirect calls:
+
+| Function | Function address | Site | Offset |
+|---|---|---|---|
+| `IOSkywalkEthernetInterface::ioctl_lladdr` | `0xffffff8002b163ea` | `0xffffff8002b16464` | `+0x140` |
+| `IOSkywalkLegacyEthernet::getHardwareAddress` | `0xffffff8002b01696` | `0xffffff8002b016fd` | `+0x140` |
+| `IOSkywalkLegacyEthernetInterface::init` | `0xffffff8002b01cac` | `0xffffff8002b01d46` | `+0x148` |
+| `IOSkywalkLegacyEthernetInterface::init` | same | `0xffffff8002b01f09` | `+0x148` |
+
+These candidate instructions need **receiver
+provenance checks**. Two calls happen in an
+initialization routine, but the matching
+vptr slot alone does **not** mean it uses
+`IOWorkLoop::removeEventSource`. Their
+actual type might be a different IOKit class,
+object or collection.
+
+Combined general ranked batches
+`[0,180)`, `[180,360)`, `[360,540)`,
+`[540,720)` cover **720/2353 ~30.6%**
+with 0 direct hits. The exhaustive
+420-class selected-owner scan **overlaps**
+the general one; do not add 420 to 720
+when describing unique coverage.
+
+### 33.3 Typed provenance work is the next bottleneck
+
+To decide whether any candidate genuinely calls
+`IOWorkLoop::removeEventSource`, retrieve
+the exact bodies of:
+
+1. `IOSkywalkNetworkInterface::removeSteeringRule`
+   at `0xffffff8002b0f43a`, specifically
+   the receiver of virtual `+0x148`
+   at `0xffffff8002b0f514`.
+2. `IOSkywalkLegacyEthernetInterface::init`
+   at `0xffffff8002b01cac`, specifically
+   both `+0x148` sites at
+   `0xffffff8002b01d46` and
+   `0xffffff8002b01f09`.
+3. `IOSkywalkTxSubmissionQueue::packetSubmission(
+   uint64_t*,uint*,uint*)` at
+   `0xffffff8002b31b2a`, especially the
+   `+0x140` at `0xffffff8002b31d12`,
+   plus `requestDequeue` at
+   `0xffffff8002b31a7c`.
+
+The read-only named-method collector now
+allows `IOSkywalkLegacyEthernetInterface`
+to support the second target. Each output
+should be read locally and *not* copied
+into public GitHub. The goal is to follow
+the register containing the receiver to its
+origin, map that object's **actual** vtable,
+and only then classify the virtual operation.
+
+### 33.4 No change to callback lifetime verdict
+
+The scan establishes a known *internal*
+TX submission path at `TxSubmissionQueue::enable`,
+but **does not** show a complete chain of
+stop producers -> detach WorkLoop -> drain
+in-flight and direct TX callbacks ->
+destroy borrowed `refCon` context.
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`,
+`ITLWM_AWDL_DATAPATH_LIVE=0` remain
+the required guardrails. Do not load
+research kexts, alter EFI or enable AWDL.

@@ -36,6 +36,7 @@ FAMILIES = (
     "IOSkywalkPacketTable",
     "IOSkywalkNetworkInterface",
     "IOSkywalkQueueSet",
+    "IOSkywalkLogicalLink",
     "IOWorkLoop",
     "IOEventSource",
     "IOCommandGate",
@@ -138,7 +139,9 @@ def main():
         parser.error("unknown or empty class selection: %s" % ", ".join(unknown))
     candidates = [symbol for symbol in kc.byname
                   if any(family in symbol for family in selected_classes)
-                  and symbol.startswith("__Z")]
+                  # C++ function symbols begin __ZN (also __ZNK for const).
+                  # Exclude __ZZN local statics such as kalloc_type_view.
+                  and symbol.startswith("__ZN")]
     names = demangle(candidates)
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     method_set = set(methods)

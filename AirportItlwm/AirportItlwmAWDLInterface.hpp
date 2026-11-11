@@ -2,7 +2,7 @@
 //  AirportItlwmAWDLInterface.hpp
 //  AirportItlwm-Tahoe
 //
-//  Stage 2/3: concrete IO80211AWDLProtocol subclass plus a fail-closed
+//  Stage 2/3/4: concrete IO80211AWDLProtocol subclass plus a fail-closed
 //  lifecycle.
 //
 //  This class is NOT instantiated, attached, registered or started. It exists
@@ -13,6 +13,11 @@
 //  module-local side table. They never call the Apple base init, allocate a
 //  packet pool or queue, or register an interface; startLifecycle() always
 //  fails closed.
+//
+//  Stage 4 adds the experimental datapath resource manager in
+//  AirportItlwmAWDLDatapath.{hpp,cpp}. It is a separate C++ object, not an
+//  ivar or virtual of this class, so the verified 0x130 size and 571-entry
+//  vtable stay intact. This header does not include it.
 //
 //  Rules that keep the ABI intact:
 //    - derive only from the experimental IO80211AWDLProtocol;
@@ -66,18 +71,24 @@ public:
      *     RegistrationInfo. They never call the Apple base init, allocate a
      *     packet pool, create a queue, or register an interface.
      *
-     * initLifecycle() records the owner and MAC. It is idempotent only in the
-     * sense that a second call on an already-initialized object fails; the
-     * owner must call teardownLifecycle() first.
+     * initLifecycle() records the owner and MAC, takes one retain on the
+     * interface, and publishes the side-table record under the lifecycle
+     * lock. The retain keeps the object alive while the address-keyed record
+     * exists. A second call on an already-initialized object fails; the owner
+     * must call teardownLifecycle() first.
      *
-     * startLifecycle() is fail-closed in Stage 3: it validates the state,
+     * startLifecycle() is fail-closed in Stage 3/4: it validates the state,
      * builds the 0x130-byte RegistrationInfo locally, checks the KC-derived
      * invariants, then returns kIOReturnUnsupported and rolls back to
      * Initialized. No partial state is left behind.
      *
      * stopLifecycle() is idempotent. Nested successful starts would be
-     * reference-counted; teardownLifecycle() is safe to call twice and frees
-     * the side-table record exactly once.
+     * reference-counted. It never drops the lifecycle retain.
+     * teardownLifecycle() drops exactly the retain taken by initLifecycle().
+     * If a start/stop transition is between its two lock windows, teardown is
+     * deferred (teardownPending) until that transition completes, so the
+     * side-table slot cannot be freed while it is still in use. Calling
+     * teardown twice is safe and frees the record exactly once.
      *
      * The owner pointer is weak: the controller owns the interface and must
      * outlive it. The interface never retains the controller, avoiding a

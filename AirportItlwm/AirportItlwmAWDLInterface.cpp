@@ -2,7 +2,7 @@
 //  AirportItlwmAWDLInterface.cpp
 //  AirportItlwm-Tahoe
 //
-//  Stage 2/3: concrete IO80211AWDLProtocol subclass plus a fail-closed
+//  Stage 2/3/4: concrete IO80211AWDLProtocol subclass plus a fail-closed
 //  lifecycle. Definitions only.
 //
 //  Every virtual method is a fail-closed stub. The Stage 3 lifecycle only
@@ -10,6 +10,10 @@
 //  access, no hardware access, no packet path, no peer cache, no channel
 //  change and no interface registration here. The class is never allocated by
 //  this driver.
+//
+//  Stage 4 adds AirportItlwmAWDLDatapath.{hpp,cpp} beside this class. That
+//  manager owns pools and queues but is not referenced from here, so this
+//  translation unit still has no packet-pool or registration dependency.
 //
 //  Compiled only when ITLWM_AWDL_EXPERIMENTAL=1. The default build compiles
 //  this file to an empty translation unit.
@@ -31,7 +35,7 @@
  * path into a live registration path by defining the macro alone.
  */
 static_assert(ITLWM_AWDL_REGISTRATION_ENABLED == 0,
-              "Stage 3 registration is not implemented; see STAGE3_BUILD_REPORT.md");
+              "Stage 4 registration is not implemented; see STAGE4_BUILD_REPORT.md");
 
 namespace {
 
@@ -44,6 +48,18 @@ namespace {
  * Locking: one IOLock protects the whole table. All lifecycle entry points
  * take it. startLifecycle() releases it while it builds and validates the
  * local RegistrationInfo, then reacquires it to commit or roll back.
+ *
+ * Lifetime: initLifecycle() takes one retain on the interface and
+ * teardownLifecycle() drops exactly that retain. The retain is what makes the
+ * address-keyed record safe: the object cannot be freed and its address
+ * reused while a record still exists. stopLifecycle() never releases the
+ * lifecycle retain. The owner must call teardownLifecycle() before dropping
+ * its own reference; if it forgets, the interface leaks instead of leaving a
+ * stale side-table entry. This class deliberately does not override free(),
+ * because that would add a vtable slot and invalidate the Stage 2 ABI.
+ *
+ * The owner pointer stored in the record is weak and is never dereferenced by
+ * this file. The controller owns the interface and must outlive it.
  */
 enum LifecycleState : uint32_t {
     kLifecycleEmpty = 0,
@@ -62,7 +78,8 @@ struct LifecycleRecord {
     IO80211Controller *owner;
     uint32_t state;
     uint32_t startCount;
-    bool holdsReference;
+    bool holdsLifecycleReference;
+    bool teardownPending;
     uint8_t mac[6];
 };
 
@@ -105,6 +122,28 @@ LifecycleRecord *claimRecordLocked(const AirportItlwmAWDLInterface *self)
         }
     }
     return nullptr;
+}
+
+/*
+ * Clear a record and report whether the caller must drop the lifecycle
+ * retain. The caller holds the table lock, clears self before releasing the
+ * lock, and performs the actual release after unlocking. That ordering is
+ * important: a concurrent initLifecycle() on the same address can only claim
+ * the slot after self is NULL, and it retains the object before the old
+ * reference is dropped, so the final release cannot race with a new owner.
+ */
+bool clearRecordLocked(LifecycleRecord *record)
+{
+    bool releaseReference = record->holdsLifecycleReference;
+
+    record->holdsLifecycleReference = false;
+    record->teardownPending = false;
+    record->state = kLifecycleTornDown;
+    record->startCount = 0;
+    record->owner = nullptr;
+    memset(record->mac, 0, sizeof(record->mac));
+    record->self = nullptr; /* frees the side-table slot exactly once */
+    return releaseReference;
 }
 
 bool isZeroMAC(const uint8_t mac[6])
@@ -162,8 +201,17 @@ initLifecycle(IO80211Controller *owner, const ether_addr &mac)
     record->owner = owner;
     record->state = kLifecycleInitialized;
     record->startCount = 0;
-    record->holdsReference = false;
+    record->holdsLifecycleReference = true;
+    record->teardownPending = false;
     memcpy(record->mac, &mac, sizeof(record->mac));
+
+    /*
+     * Take the lifecycle retain while the record is published under the
+     * lock. teardownLifecycle() will drop exactly this reference. The retain
+     * is what prevents the object from being freed and its address reused
+     * while the side-table entry still points at it.
+     */
+    this->retain();
 
     IOLockUnlock(lock);
     return true;
@@ -206,12 +254,19 @@ buildRegistrationInfo(void *buffer, size_t size) const
     memset(info, 0, sizeof(*info));
 
     /*
-     * These are the values initRegistrationInfo() writes on 25G332, using
-     * the base class fallbacks (2, 0x20, 0x2e, 0x5dc) rather than calling
-     * the base virtuals. bsdNamePrefix is left NULL because neither
-     * registerNetworkInterface() nor copyRegistrationInfo() reads it before
-     * the Ethernet registration step; a future registration path must
-     * replace it with a real prefix pointer.
+     * These are the values initRegistrationInfo() writes on 25G332, with the
+     * AWDL corrections verified in AppleBCMWLANProximityInterface:
+     *
+     *   - start() patches both MTU fields to 0x594 (1428), not 0x5dc;
+     *   - getBSDNamePrefix() returns "awdl";
+     *   - headroom (+0x3c) stays 0 because the base init zeroes it and
+     *     start() does not patch it;
+     *   - media (+0x28) and minimum packet size (+0x44) keep the base
+     *     fallbacks because start() does not patch them.
+     *
+     * The prefix points at a static string literal, so it stays valid for as
+     * long as the buffer exists. A live path must still confirm that the
+     * controller wants the same family/subfamily/media values.
      */
     info->prefix.version = kRegistrationVersion;
     info->prefix.size = kEthernetRegistrationSize;
@@ -219,12 +274,14 @@ buildRegistrationInfo(void *buffer, size_t size) const
     info->prefix.interfaceSubFamily = 0;
     info->prefix.maxSize = 0x100;
     info->prefix.reserved2 = 0x22;
-    info->prefix.initialMedia = 0x20;
-    info->prefix.bsdNamePrefix = 0;
+    info->prefix.initialMedia = itlwm_awdl_25g332::kAwdlInitialMedia;
+    info->prefix.bsdNamePrefix =
+        reinterpret_cast<uintptr_t>(itlwm_awdl_25g332::kAwdlBsdNamePrefix);
     info->prefix.bsdUnitNumber = 0;
-    info->prefix.minPacketSize = 0x2e;
-    info->prefix.maxTransferUnit = 0x5dc;
-    info->prefix.maxTransferUnit2 = 0x5dc;
+    info->prefix.txDataOffset = itlwm_awdl_25g332::kAwdlTxDataOffset;
+    info->prefix.minPacketSize = itlwm_awdl_25g332::kAwdlMinPacketSize;
+    info->prefix.maxTransferUnit = itlwm_awdl_25g332::kAwdlMaxTransferUnit;
+    info->prefix.maxTransferUnit2 = itlwm_awdl_25g332::kAwdlMaxTransferUnit;
     memcpy(info->mac, mac, sizeof(mac));
 
     return true;
@@ -241,6 +298,16 @@ startLifecycle()
 
     LifecycleRecord *record = findRecordLocked(this);
     if (record == nullptr || record->state == kLifecycleTornDown) {
+        IOLockUnlock(lock);
+        return kIOReturnNotOpen;
+    }
+
+    /*
+     * teardownLifecycle() can arrive while a start transition is between the
+     * two lock windows. It sets teardownPending instead of clearing the
+     * record out from under us. A new start must not begin in that state.
+     */
+    if (record->teardownPending) {
         IOLockUnlock(lock);
         return kIOReturnNotOpen;
     }
@@ -289,11 +356,16 @@ startLifecycle()
             /*
              * Re-check the invariants registerNetworkInterface() enforces
              * (version 1, size >= 0x108, maxSize <= 0x400) plus the exact
-             * 0x130 size initRegistrationInfo() requires.
+             * 0x130 size initRegistrationInfo() requires and the AWDL values
+             * verified in AppleBCMWLANProximityInterface.
              */
             if (info->prefix.version != kRegistrationVersion ||
                 info->prefix.size != kEthernetRegistrationSize ||
-                info->prefix.maxSize > kRegistrationMaxSizeField) {
+                info->prefix.maxSize > kRegistrationMaxSizeField ||
+                info->prefix.maxTransferUnit != itlwm_awdl_25g332::kAwdlMaxTransferUnit ||
+                info->prefix.maxTransferUnit2 != itlwm_awdl_25g332::kAwdlMaxTransferUnit ||
+                info->prefix.txDataOffset != itlwm_awdl_25g332::kAwdlTxDataOffset ||
+                info->prefix.bsdNamePrefix == 0) {
                 result = kIOReturnBadArgument;
             } else {
                 IOLockLock(lock);
@@ -303,13 +375,17 @@ startLifecycle()
                 IOLockUnlock(lock);
 
                 /*
-                 * Stage 3 stops here. The reviewed future sequence is:
+                 * Stage 3/4 stops here. The Stage 4 manager
+                 * (AirportItlwmAWDLDatapath.{hpp,cpp}) implements the
+                 * reviewed resource sequence in isolation, but this file
+                 * does not call it. The future wiring is:
                  *
                  *   1. IOSkywalkPacketBufferPool::withName(...) for the TX
                  *      and RX pools, with a real PoolOptions (packetCount,
                  *      bufferCount, bufferSize, maxBuffersPerPacket,
                  *      memorySegmentSize, poolFlags);
-                 *   2. IOSkywalkPacketQueue allocation / IOSkywalkQueueSet;
+                 *   2. IOSkywalkTxSubmissionQueue / TxCompletionQueue /
+                 *      RxCompletionQueue with the KC minimum capacities;
                  *   3. IOSkywalkEthernetInterface::initRegistrationInfo()
                  *      or the equivalent fill, then deferBSDAttach();
                  *   4. registerEthernetInterface(info, queues, count,
@@ -317,8 +393,8 @@ startLifecycle()
                  *   5. enable()/setInterfaceEnable(true) only after the
                  *      link state machine and sync parameters are live.
                  *
-                 * None of that is implemented or called here. Returning
-                 * success would be a fake registration.
+                 * None of that is called here. Returning success would be a
+                 * fake registration.
                  */
                 result = kIOReturnUnsupported;
             }
@@ -326,19 +402,30 @@ startLifecycle()
     }
 
     /*
-     * Full rollback: Starting/Prepared return to Initialized. No pool, queue,
-     * registration, retain, or MAC state survives a failed start.
+     * Full rollback: Starting/Prepared return to Initialized. No pool, queue
+     * or registration state survives a failed start. The lifecycle retain is
+     * not part of the start rollback; it belongs to initLifecycle() and is
+     * dropped only by teardownLifecycle().
+     *
+     * If teardownLifecycle() arrived while this start was between lock
+     * windows, it set teardownPending. Finish that teardown here and drop the
+     * lifecycle retain exactly once.
      */
+    bool releaseReference = false;
     IOLockLock(lock);
     record = findRecordLocked(this);
-    if (record != nullptr &&
-        (record->state == kLifecycleStarting ||
-         record->state == kLifecyclePrepared)) {
+    if (record != nullptr && record->teardownPending) {
+        releaseReference = clearRecordLocked(record);
+    } else if (record != nullptr &&
+               (record->state == kLifecycleStarting ||
+                record->state == kLifecyclePrepared)) {
         record->state = kLifecycleInitialized;
         record->startCount = 0;
-        record->holdsReference = false;
     }
     IOLockUnlock(lock);
+
+    if (releaseReference)
+        this->release();
 
     return result;
 }
@@ -356,6 +443,19 @@ stopLifecycle()
     if (record == nullptr || record->state == kLifecycleTornDown) {
         /* Already stopped / torn down: idempotent. */
         IOLockUnlock(lock);
+        return kIOReturnSuccess;
+    }
+
+    /*
+     * A deferred teardown belongs to whichever transition is finishing. If
+     * this stop sees it first (for example after a failed start rolled back
+     * to Initialized), finish it here and drop the lifecycle retain once.
+     */
+    if (record->teardownPending) {
+        bool releaseReference = clearRecordLocked(record);
+        IOLockUnlock(lock);
+        if (releaseReference)
+            this->release();
         return kIOReturnSuccess;
     }
 
@@ -378,21 +478,24 @@ stopLifecycle()
 
     record->startCount = 0;
     record->state = kLifecycleStopping;
-    bool releaseReference = record->holdsReference;
-    record->holdsReference = false;
 
     IOLockUnlock(lock);
 
     /*
      * Stage 3 holds no resources. A reviewed stop must deregister the
      * Ethernet interface and release the pools/queues here, in the reverse
-     * order of the start sequence.
+     * order of the start sequence. The lifecycle retain is NOT dropped here;
+     * only teardownLifecycle() owns it.
      */
 
+    bool releaseReference = false;
     IOLockLock(lock);
     record = findRecordLocked(this);
-    if (record != nullptr && record->state == kLifecycleStopping)
+    if (record != nullptr && record->teardownPending) {
+        releaseReference = clearRecordLocked(record);
+    } else if (record != nullptr && record->state == kLifecycleStopping) {
         record->state = kLifecycleInitialized;
+    }
     IOLockUnlock(lock);
 
     if (releaseReference)
@@ -417,13 +520,22 @@ teardownLifecycle()
         return;
     }
 
-    bool releaseReference = record->holdsReference;
-    record->holdsReference = false;
-    record->state = kLifecycleTornDown;
-    record->startCount = 0;
-    record->owner = nullptr;
-    memset(record->mac, 0, sizeof(record->mac));
-    record->self = nullptr; /* frees the side-table slot exactly once */
+    /*
+     * If a start/stop transition is between its two lock windows, clearing
+     * the record now would free the side-table slot while that transition
+     * still expects to find it. Defer the clear to the transition's
+     * completion path instead. The transition still holds the lifecycle
+     * retain, so `this` stays valid.
+     */
+    if (record->state == kLifecycleStarting ||
+        record->state == kLifecyclePrepared ||
+        record->state == kLifecycleStopping) {
+        record->teardownPending = true;
+        IOLockUnlock(lock);
+        return;
+    }
+
+    bool releaseReference = clearRecordLocked(record);
 
     IOLockUnlock(lock);
 

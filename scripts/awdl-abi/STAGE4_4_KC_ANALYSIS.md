@@ -2075,3 +2075,152 @@ forgot to remove it.
    before `TxCallbackContext` destruction.
 4. Keep both Stage 4 registration/datapath flags
    disabled and do not modify runtime/EFI.
+
+
+
+## 26. LogicalLink command dispatch and NetworkInterface stop/free (2026-11-11)
+
+**Source:** developer-supplied local Tahoe 25G332 disassembly
+for `IOSkywalkLogicalLink::setEnable`,
+`IOSkywalkTxSubmissionQueue::performCommand`,
+`IOSkywalkPacketQueue::performCommand`,
+`IOSkywalkNetworkInterface::{stop,free}`.
+No proprietary KC instruction dump is copied here.
+
+### 26.1 LogicalLink enable/disable cascade propagates QueueSet errors
+
+`IOSkywalkLogicalLink::setEnable(bool)`
+at `0xffffff8002b11652`:
+
+- Rejects a LogicalLink with no QueueSet entries
+  (`LogicalLink+0x28 == 0`), returning
+  `0xe00002bc`.
+- Iterates its QueueSet pointers at
+  `LogicalLink+0x10`, calling each object's
+  vptr `+0x118 = QueueSet::setEnable(bool)`
+  with the original bool argument.
+- Exits early on any nonzero QueueSet result;
+  otherwise returns zero.
+
+**Nuance:** the local `QueueSet::setEnable`
+body itself calls each queue's `enable/disable`
+without inspecting any return value and returns
+zero. Therefore the LogicalLink early-error
+branch does not prove that queue shutdown errors
+are accurately propagated.
+
+The method does not call `IOWorkLoop::removeEventSource`
+or drain direct TX callback users.
+
+### 26.2 TX performCommand operates on queue configuration, not visible detach
+
+`IOSkywalkTxSubmissionQueue::performCommand(unsigned,void*,unsigned long)`
+at `0xffffff8002b128b6` selects among a
+small set of commands using an integer transformation
+and jump table. The inspected branches include:
+
+- A 16-byte output structure, when supplied with
+  a non-null output pointer and correct length,
+  receiving a fixed version/value, the queue
+  capacity from `queue+0xac`, and the pool pointer
+  from `queue+0x50`.
+- Assignment to `queue+0xf8` and to
+  configuration fields `queue+0x164`,
+  `queue+0x144` from a caller-provided structure.
+- A branch setting flag `queue+0x142 |= 4`.
+- An `addReporters(IOService*,OSSet*)` call
+  with validated 16-byte input.
+- An unknown/unrecognized command path
+  delegating to base `IOSkywalkPacketQueue::performCommand`
+  through a raw base vtable `__ZTV+0x228`.
+  The base method at `0xffffff8002b0df98`
+  returns `0xe00002c7` in the reviewed body.
+
+The prior `QueueSet::initialize` sends command
+`0x50000` through this virtual `+0x218`.
+The exact jump-table target and the semantic
+label of that command are **not established**
+by this symbol-level evidence; do not claim
+it starts or stops TX. No direct
+`packetSubmission`, `removeEventSource` or
+callback-drain call is present in the shown
+TX command body.
+
+Some bytes following the function's return
+belong to the jump table and disassemble
+as nonsensical opcodes; treat these as **data**,
+not executable paths.
+
+### 26.3 NetworkInterface stop and free
+
+`IOSkywalkNetworkInterface::stop(IOService*)`
+at `0xffffff8002b0ee66`:
+
+- Checks `interface+0xc0` for registration
+  state, and when present invokes
+  `deregisterNetworkInterface`.
+- Tail-calls the superclass
+  `IOSkywalkInterface::stop(IOService*)`
+  through raw base vtable `__ZTV+0x5d8`.
+  The actual superclass method body remains
+  to be inspected before asserting it does
+  or does not detach event sources.
+
+`IOSkywalkNetworkInterface::free()`
+at `0xffffff8002b0effe`:
+
+- Invokes `deregisterNetworkInterface`
+  unconditionally.
+- If private state at `interface+0xc0`
+  remains, and an internal thread-call pointer
+  at `private+0x28` exists, calls
+  `_thread_call_cancel` then
+  `_thread_call_free`, and clears the
+  pointer. The corresponding callback function
+  and whether cancellation synchronizes
+  in-flight execution have not been identified.
+- Frees locks at `private+0x10/+0x18`;
+  releases a private object at `+0x20`,
+  frees the private allocation and sets
+  `interface+0xc0=nullptr`.
+- Delegates to superclass `free()`.
+
+No direct `IOWorkLoop::removeEventSource` call
+was identified in these two local bodies.
+However, their inherited superclass methods,
+deregistration dependencies and child-queue
+release sequences are separate paths and
+must not be assumed to lack cleanup.
+
+**Important distinction:** `thread_call_cancel`
+might cancel queued work without necessarily
+proving that a callback already executing on
+another thread has exited. The presence of
+`thread_call_cancel/free` is not proof of
+a no-future-`TxCallbackContext` barrier,
+nor is this private thread-call yet proven
+to invoke TX submission callbacks specifically.
+
+### 26.4 Remaining proof gap and next target
+
+1. Inspect `IOSkywalkInterface` owner/superclass
+   lifecycle to see whether it tracks workloops
+   or removes event sources.
+2. Inspect `IOSkywalkNetworkInterface::enable`
+   and `disable` to identify the actual
+   network-interface state transitions, and
+   corresponding direct TX producers.
+3. Independently locate actual TX queue
+   `addEventSource/removeEventSource`
+   call sites; class and method names alone
+   are insufficient for ownership claims.
+4. Confirm that **no future direct TX callback**
+   can arrive and **all previously entered
+   callbacks have exited** before deleting
+   the embedded `SkywalkBackend::txCallbackContext_`.
+5. Keep experimental registration and datapath
+   flags disabled; no runtime/EFI changes.
+
+**Evidence status:** static owner cleanup is better
+understood, but the full callback lifetime
+invariant is still unproven.

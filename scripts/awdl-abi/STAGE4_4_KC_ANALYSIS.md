@@ -227,3 +227,129 @@ The seventh entry is a kalloc type-view metadata symbol with zero instructions.
 **Only the console summary, not the contents of `/tmp/awdl-skywalk-packet-lifetime.txt`, has been received.** No conclusions about these methods' internal error handling, resource release ordering or success paths are warranted yet.
 
 **Next:** collect `finalize()` bodies for the base and specialized queues using the read-only collector, and review the developer's local packet-lifetime evidence file. Keep AWDL runtime flags off.
+
+
+## 11. Packet lifetime and queue finalize: full developer-uploaded disassembly
+
+**Source:** two developer-uploaded local text files, `awdl-skywalk-packet-lifetime.txt`
+and `awdl-skywalk-finalize.txt`, from the local 25G332 BootKernelExtensions.kc.
+This is a paraphrased behavioral analysis; no bulk KC disassembly is
+committed here. All addresses and offsets are specific to this KC.
+
+### 11.1 Deallocation is a real native pool-return call
+
+- `IOSkywalkPacketBufferPool::deallocatePacket(packet)` at
+  `0xffffff8002b310de`: null packets are skipped; for non-null wrappers,
+  it saves the native packet handle at wrapper `+0x28`; if state bit
+  `+0x58 & 2` is set, invokes `completePreparedPacket`; then invokes
+  virtual wrapper `disposePacket()` at vptr `+0x1e0` and tail-calls
+  `_kern_pbufpool_free(pool->+0x18, savedNativeHandle)`.
+- `IOSkywalkPacketBufferPool::deallocatePackets(array,count)` at
+  `0xffffff8002b31128`: null pointer or zero count returns. Otherwise,
+  **per element** it conditionally calls `completePreparedPacket`,
+  replaces the pointer in the supplied array with the wrapper's native
+  packet handle (wrapper `+0x28`), calls `disposePacket()`, and finally
+  tail-calls `_kern_pbufpool_free_batch(pool->+0x18,array,count)`.
+  It does **not** validate each element for null or return a per-packet
+  success status in the shown path.
+- This identifies the native pool return operations, strengthening the
+  evidence that TX completion's pointer-array and linked-list overloads
+  reclaim native handles. But it is **not** evidence that these calls may
+  be invoked with unprepared/duplicate packets, nor an independent
+  contract for when another owner may recycle the same address.
+- **Important implementation detail:** batch deallocation overwrites the
+  supplied pointer array in place with `kern_packet_t` values. The
+  reviewed TX array overload uses its own queue-internal scratch array;
+  code tracking packet-wrapper pointers must not assume that array
+  still contains `IOSkywalkPacket*` after the call.
+
+### 11.2 Completion and disposal are distinct from free-to-pool
+
+- `IOSkywalkPacket::completeWithQueue(queue, mode, flags)` at
+  `0xffffff8002b0b6fa`: iterates packet buffers and calls their
+  virtual `+0x148`, then for `mode == 2` calls
+  `_kern_packet_finalize(nativeHandle)` and, if `wrapper+0x38` exists,
+  invokes a virtual callback `+0x220` on that object. It clears
+  `wrapper+0x58 & 2` and finally tail-calls the **packet** virtual
+  method at `+0x1a0`. The targets of packet `+0x1a0`, buffer
+  `+0x148` and auxiliary-object `+0x220` are still unknown.
+- `IOSkywalkPacket::disposePacket()` at `0xffffff8002b0b854`:
+  iterates packet buffers and calls `disposePacketBuffer()` on each,
+  then zeros the native packet-handle pointer `wrapper+0x28` and
+  several wrapper metadata fields. **It does not itself call
+  `_kern_pbufpool_free` or `_kern_pbufpool_free_batch`.**
+- This matters for RX Networking: its handoff to
+  `_kern_netif_queue_rx_enqueue` is after `disposePacket()` on
+  wrappers. The native handles are saved in a separate linked list;
+  whether their ownership is then always accepted/freed must be
+  established from the netif enqueue callee and the caller contract.
+
+### 11.3 Pool destructor is cleanup, not evidence of a safe drain
+
+- `IOSkywalkPacketBufferPool::releaseAllPackets` at
+  `0xffffff8002b0a57c` releases an owned object at `+0x60`,
+  clears pool bookkeeping, and frees metadata storage at `+0x58`.
+- `releaseAllMemorySegments` at `0xffffff8002b0a5d4` iterates
+  an object collection at `+0x68` using a block callback, then
+  releases the collection.
+- Neither shown body waits for TX/RX callbacks. Calling pool-level
+  release while another owner still holds native packets would
+  remain a lifecycle hazard.
+
+### 11.4 Queue finalize call graph and state counter
+
+The base `IOSkywalkPacketQueue::finalize()` at
+`0xffffff8002b0ddcc` does **not** merely close the event gate:
+
+1. If `queue+0xbc` is zero, return success immediately.
+2. Otherwise, decrement `queue+0xbc` and invoke virtual `queue-vptr
+   +0x18` (method identity not yet resolved).
+3. Depending on the virtual result and remaining count, possibly invoke
+   `IOSkywalkPacketBufferPool::checkOutPacketQueue(pool,queue)`.
+4. If the counter remains nonzero, return `0xe00002d5`; when it
+   reaches zero, clear `queue+0xcc` and return success.
+
+The observed count manipulation is **not** proof that all callback
+invocations have exited, nor that the counter is an in-flight callback
+counter. `checkOutPacketQueue` and the vptr `+0x18` target must be
+identified before the counter can be interpreted as a safe-drain proof.
+
+Specialized `finalize()` wrappers all enter `IOEventSource::closeGate`
+when a workloop is present, invoke **base** finalize via raw
+`__ZTV20IOSkywalkPacketQueue+0x1d0` (object-vptr `+0x1c0`), then
+reopen the event-source gate:
+
+| Method | After the base finalize | Implication |
+|---|---|---|
+| `TxSubmissionQueue::finalize` `0xffffff8002b11f16` | On base success, calls the queue's own virtual method `+0x2a0`, then clears `+0xf8`, `+0x13c`, `+0xe0` | Need name/body of `+0x2a0`; no explicit callback drain in this wrapper |
+| `TxCompletionQueue::finalize` `0xffffff8002b17d6e` | On base success, clears `+0xe8`, `+0x110`. **Converts base return `0xe00002d5` into success (0)** without those resets | A reported success can mean the base queue is **not yet fully finalized**; do not use this return code alone as a no-callbacks guarantee |
+| `RxCompletionQueue::finalize` `0xffffff8002b140f6` | On base success, calls `IOSkywalkPacketTable::flushAllPackets(table,pool)`, clears `+0xf0`, `+0x118`, `+0xe0` | Flushes stored table packets in the success case; still not a demonstrated prevention of future callback entry |
+
+**Particularly dangerous observation:** `IOSkywalkTxCompletionQueue::free()`
+calls its virtual `finalize()` without checking the returned status before
+freeing buffer storage, stats and the lock. Since the specialized finalize
+can translate `0xe00002d5` into 0, no safe no-future-callback guarantee
+follows solely from a call to `free()`.
+
+This is a risk statement about **unproven preconditions**, not proof
+that Apple's own callers are incorrect: they may arrange the necessary
+serialization/detach **before** calling `free()`.
+
+### 11.5 Remaining conditions before live use
+
+1. Resolve the object-vptr `+0x18` used in base queue finalize, the
+   TX submission vptr `+0x2a0`, packet `+0x1a0` and packet-buffer
+   `+0x148`. Resolve receiver class before naming a target.
+2. Trace `checkOutPacketQueue`, packet-table
+   `flushAllPackets`, and the owner workloop detach/removal that
+   prevents callbacks from entering after `refCon` is freed.
+3. Confirm the native networking enqueue ownership/failure contract for
+   RX and that pool deallocation semantics are compatible with packet
+   accounting, including partial batches and teardown.
+4. Keep the experimental callback gate **disarmed**, allocation and AWDL
+   registration hard-disabled, and all packet-ledger models host-only.
+
+**Conclusion:** named packet-reclamation operations have been
+confirmed in the local 25G332 KC, and queue finalize semantics are more
+complex than a simple drain. The key no-future-callback lifetime
+invariant remains unverified. Do not install or load experimental AWDL.

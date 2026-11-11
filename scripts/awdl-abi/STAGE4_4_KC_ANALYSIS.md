@@ -448,3 +448,102 @@ not proof that native packet buffers have been freed.
 **Safety conclusion:** keep all Stage 4.2/4.3 runtime gates disabled;
 do not infer that canceling RX packet completion callbacks also
 quiesces the TX submission callback.
+
+
+
+## 13. Retain-count and packet completion callback mappings (2026-11-11)
+
+**Evidence:** developer-provided local vtable mapping and three function
+bodies from `BootKernelExtensions.kc` on Tahoe 25G332. This section
+paraphrases the relevant operations only.
+
+### 13.1 Previously unknown virtual targets, now resolved
+
+| Object and vptr offset | Resolved method | KC address |
+|---|---|---|
+| `IOSkywalkPacketQueue +0x18` | `OSObject::getRetainCount() const` | `0xffffff8000a1df50` |
+| `IOSkywalkTxSubmissionQueue +0x2a0` | `IOSkywalkTxSubmissionQueue::purgePackets()` | `0xffffff8002b12870` |
+| `IOSkywalkPacket +0x1a0` | `IOSkywalkPacket::complete(IOSkywalkPacketQueue*,unsigned)` | `0xffffff8002b0b6ae` |
+| `IOSkywalkPacketBuffer +0x148` | `IOSkywalkPacketBuffer::completeWithQueue(IOSkywalkPacketQueue*,unsigned,unsigned)` | `0xffffff8002b0bde8` |
+
+The base queue `finalize()` virtual call `this->vptr+0x18`
+therefore reads **OSObject retain count**, not a callback-drain
+counter or an independent queue operation. The base method still
+decrements **its own field `queue+0xbc`**, and may call pool
+`checkOutPacketQueue` depending on the retain count and remaining
+`+0xbc`. These two counters must not be conflated. The precise
+meaning of `+0xbc` is still unverified.
+
+The specialized TX submission `finalize()` calls
+`purgePackets()` on the successful base-finalize path, but
+`purgePackets` body and race behavior remain to be inspected.
+
+The `IOSkywalkPacket::completeWithQueue` path tail-calls
+`IOSkywalkPacket::complete()` and sends packet-buffer notifications
+through `IOSkywalkPacketBuffer::completeWithQueue()`.
+Those targets are now named but their actual bodies/side effects
+still require inspection.
+
+### 13.2 Completion callback cancellation merely clears a field
+
+`IOSkywalkPacket::cancelCompletionCallback()` at
+`0xffffff8002b0b8d4` is exactly a store of null to
+`this+0x38`. `IOSkywalkPacketBuffer::cancelCompletionCallback()`
+at `0xffffff8002b0beaa` is exactly a store of null to
+`this+0x48`.
+
+Neither routine visibly takes a lock, waits for callback work, or
+releases a reference in its small body. A callback that already
+captured the previous pointer may still be running. This is
+**per-packet** completion cancellation, not prevention of new
+`TxSubmissionQueue` callbacks using the queue's `refCon`.
+
+The RX flush's call to `cancelCompletionCallback()` must not be
+described as a global callback quiescence barrier.
+
+### 13.3 `IOSkywalkPacketBufferPool::checkInPacketQueue`
+
+Method `0xffffff8002b0aafe`:
+
+1. Acquires recursive pool lock at `pool+0x80`.
+2. Creates a pool-owned `OSSet` at `pool+0x90` if absent
+   (initial capacity 8), then calls virtual offset `+0x1c0`
+   on that `OSSet` with the queue. This is consistent with
+   inserting/retaining a queue in the set; the exact vtable
+   method name has not been independently mapped.
+3. Unlocks `pool+0x80`.
+4. Calls `queue->getInterface()`. If there is no interface
+   and the set insertion returned nonzero, schedules the pool's
+   deferred task through `_thread_call_enter(pool+0xb0)`.
+
+This is evidence of **asynchronous pool-side queue housekeeping**
+which may run after `checkInPacketQueue` returns. Pool
+`free()` cancels its own `thread_call` using
+`_thread_call_cancel_wait`, but this does **not** establish
+that TX submission workloop callbacks are also canceled.
+The owner-side queue deregistration and scheduling order must be
+examined before callback context release.
+
+The earlier `checkOutPacketQueue` removes queue-related
+registrations under the pool lock. This is separate from the
+TX submission callback's workloop entry path.
+
+### 13.4 Outstanding high-risk invariant
+
+**Before freeing `TxCallbackContext`, prove both:**
+- No *future* callback can enter and dereference this context,
+  accounting for workloop events and deferred scheduling.
+- Every callback already admitted has returned (and any completion
+  callbacks referencing its objects have been canceled or drained).
+
+A disarmed `CallbackGate`, a zero in-flight admission count,
+`purgePackets()`, or `finalize()` **alone** is not that proof.
+The experimental kext remains fail-closed.
+
+### 13.5 Next local evidence
+
+Collect `IOSkywalkTxSubmissionQueue::purgePackets()`,
+`IOSkywalkPacket::complete()`, and
+`IOSkywalkPacketBuffer::completeWithQueue()` bodies and inspect
+`TxSubmissionQueue::initWithPool` to establish callback/refCon
+storage and scheduling. Do not change runtime flags.

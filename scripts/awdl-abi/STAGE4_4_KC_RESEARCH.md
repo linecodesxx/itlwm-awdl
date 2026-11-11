@@ -1662,19 +1662,96 @@ python3 scripts/awdl-abi/scan_skywalk_direct_calls.py \\
 cat /tmp/awdl-skywalk-direct-callers-180-360.txt
 ```
 
-The OSSet slot check disambiguates
-client registration/removal. The second
-checks the next 180 prioritized named
-functions for direct calls to the
-known 25G332 WorkLoop attach/detach and
-TX packetSubmission addresses. A no-hit
-result still does **not** clear the
-borrowed-`TxCallbackContext` UAF risk;
-virtual calls and owner-side teardown
-remain the principal unanswered questions.
+The subsequent local OSSet vtable lookup
+resolved `+0x1c0 = setObject` and
+`+0x1d8 = removeObject`. The second
+180-function batch also returned no direct
+hits, so ranked coverage is 360/2353
+(about 15.3%) with zero direct matches.
+See the subsequent indirect-slot investigation.
 
 Runtime AWDL flags remain disabled:
 `ITLWM_AWDL_REGISTRATION_ENABLED=0`,
 `ITLWM_AWDL_DATAPATH_LIVE=0`.
 Do not install experimental drivers,
 change EFI or publish KC disassembly.
+
+
+
+## OSSet member calls confirmed; begin guarded virtual-slot candidate scan (2026-11-11)
+
+The developer's local 25G332 OSSet vtable inspection
+identified `+0x1c0=OSSet::setObject` and
+`+0x1d8=OSSet::removeObject`.
+Together with `IOSkywalkInterface::init/handleOpen/handleClose`,
+this proves that the private OSSet is the
+lock-protected client registry, **not** an
+indirect TX submission callback.
+
+The second bounded scanner batch,
+`--skip-functions 180 --max-functions 180`,
+covered ranked functions `[180,360)`
+with 0 direct target matches, 0 disassembly
+failures and 0 truncated functions.
+Combined coverage is `[0,360)` of
+**2353**, roughly **15.3%** of
+the scanner's symbolic function candidate
+pool. **No-hit is not no-callback proof.**
+
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 31.
+
+### New cautious indirect-slot option
+
+Updated
+`scripts/awdl-abi/scan_skywalk_direct_calls.py`
+with opt-in `--virtual-offsets` and
+`--max-virtual-hits`. It can report
+candidate indirect calls that look like
+`call qword ptr [reg + offset]` alongside
+the existing exact direct-target scan.
+Such matches **do not establish**
+a virtual call, receiver type or target
+method: an offset shared across classes
+is not a call-graph identity. The output
+is a bounded summary of symbolic caller,
+site and slot, not KC disassembly.
+
+### Next two local read-only collections (both end with cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOWorkLoop \\
+  --offsets 0x140,0x148,0x150,0x158,0x160,0x168,0x170,0x178,0x180,0x188,0x190,0x198,0x1a0,0x1a8,0x1b0 \\
+  > /tmp/awdl-workloop-attach-slots.txt
+
+cat /tmp/awdl-workloop-attach-slots.txt
+
+python3 scripts/awdl-abi/scan_skywalk_direct_calls.py \\
+  --families IOSkywalk,IOUserNetwork,IOEthernet \\
+  --skip-functions 360 --max-functions 180 --max-lines 450 \\
+  --virtual-offsets 0x1d8,0x120,0x150,0x158,0x1c0 \\
+  --max-virtual-hits 70 \\
+  --out /tmp/awdl-skywalk-callers-360-540.txt
+
+cat /tmp/awdl-skywalk-callers-360-540.txt
+```
+
+The WorkLoop vtable identifies whether the
+native attach/detach functions are represented
+at virtual slots on this KC. The second
+collection scans the next ranked function
+slice for both direct calls and **candidate**
+indirect-slot dispatches; any nonzero
+indirect matches require receiver-provenance
+analysis in exactly those callers before
+naming them. The scanned range and
+limitations should be preserved with
+the report.
+
+No experimental AWDL registration or TX
+datapath, no kext loading or EFI changes.
+Do not publish original Apple KC assembly.

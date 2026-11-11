@@ -1498,18 +1498,111 @@ python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
 cat /tmp/awdl-skywalk-interface-termination.txt
 ```
 
-The first identifies whether `setInterfaceEnable`
-cascades to LogicalLink/QueueSet and whether
-`setInterface` owns or merely stores the
-association. The second checks higher-level
-termination hooks for queue teardown
-ordering and event-source removal.
-If neither contains a direct remove call,
-an owner/caller-oriented vtable and
-cross-reference investigation will still
-be necessary.
+The follow-up local KC results found a **no-op**
+`IOSkywalkNetworkInterface::setInterfaceEnable`,
+a **pointer-only** `IOSkywalkPacketQueue::setInterface`
+and termination hooks with no explicit queue detach.
+The named-method approach is now supplemented by
+a bounded direct-call cross-reference scan (below).
+Note that overriding subclasses can change the
+virtual enable implementation.
 
 Only read local KC disassembly; do not
 publish proprietary output, install kexts,
 modify EFI, or enable the experimental AWDL
 code paths.
+
+
+
+## Queue/interface association and bounded direct-caller scan (2026-11-11)
+
+The developer provided new local Tahoe 25G332
+bodies of `IOSkywalkNetworkInterface::setInterfaceEnable`,
+`IOSkywalkPacketQueue::setInterface`, and
+`IOSkywalkInterface::{willTerminate,didTerminate,handleClose}`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 29.
+
+- **`NetworkInterface::setInterfaceEnable(bool)`
+  returns success immediately.** No queue,
+  `LogicalLink` or WorkLoop operation appears
+  in this class's method body. A concrete
+  derived-class override may still do more.
+- **`PacketQueue::setInterface(interface)`
+  stores the raw interface pointer at
+  `queue+0x70` without retaining it** and
+  records the interface's registry ID in
+  `queue+0x90/+0xa0`. Passing null
+  clears those values.
+  The `IOSkywalkInterface` deregistration
+  body did not call the setter with null,
+  leaving exact owner ordering to be proved.
+- `IOSkywalkInterface::willTerminate` sets
+  a private flag at `private+0x8`.
+  `didTerminate` delegates conditionally
+  through two yet-unresolved inherited
+  vtable entries. `handleClose` acquires
+  a private `IOLock` and dispatches
+  `+0x1d8` on an **unidentified private
+  object**; this must not be misidentified
+  as TX queue's `packetSubmission` solely
+  because the offset matches.
+- These routines do **not** provide
+  a proven direct-TX no-future-callback
+  barrier or a verified
+  `removeEventSource(txQueue)` invocation.
+
+### Improved next approach
+
+A new research-only script,
+`scripts/awdl-abi/scan_skywalk_direct_calls.py`,
+performs bounded, **read-only** disassembly
+of relevant named functions and reports
+direct `call/jmp` sites to three known
+local `25G332` targets:
+`IOWorkLoop::addEventSource`,
+`IOWorkLoop::removeEventSource`, and
+`TxSubmissionQueue::packetSubmission(bool)`.
+It outputs only symbolic caller information,
+**not raw KC instructions**.
+
+This scan is deliberately incomplete:
+virtual dispatch, function pointers,
+inlining, other classes and truncated
+functions are not captured. **A no-hit
+result is NOT evidence of callback
+quiescence or teardown correctness.**
+We also need to inspect
+`IOSkywalkInterface::init/handleOpen`
+to identify the private object's type
+before interpreting `handleClose+0x1d8`.
+
+### Next read-only local checks (each ends in cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/scan_skywalk_direct_calls.py \\
+  --families IOSkywalk,IOUserNetwork,IOEthernet \\
+  --max-functions 180 --max-lines 450 \\
+  --out /tmp/awdl-skywalk-direct-callers.txt
+
+cat /tmp/awdl-skywalk-direct-callers.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkInterface \\
+  --methods init,handleOpen,clientDisconnect \\
+  --max-functions 6 --max-lines 400 \\
+  --out /tmp/awdl-skywalk-private-object.txt
+
+cat /tmp/awdl-skywalk-private-object.txt
+```
+
+All actions remain local static research.
+No Apple KC disassembly is added to
+public GitHub. Preserve
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`
+and `ITLWM_AWDL_DATAPATH_LIVE=0`
+until the callback entry/barrier protocol
+is proven.

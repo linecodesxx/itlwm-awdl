@@ -75,11 +75,25 @@ extern "C" IOSkywalkRxCompletionQueue *awdlRxCompletionWithPool(
     RxCompletionAction, void *, uint32_t)
     asm("__ZN26IOSkywalkRxCompletionQueue8withPoolEP25IOSkywalkPacketBufferPooljjP8OSObjectPFjS3_PS_PP15IOSkywalkPacketjPvES8_j");
 
-uint32_t txSubmissionAction(OSObject *, IOSkywalkTxSubmissionQueue *,
-                            IOSkywalkPacket * const *, uint32_t, void *)
+struct TxCallbackContext {
+    OSObject *target; /* weak: the owner must outlive all queues */
+    itlwm_awdl_datapath::TxAction action;
+};
+
+/*
+ * Exact KC callback ABI. The queue owns neither the target nor refCon;
+ * both must remain valid until pending callbacks have drained.
+ * Stage 4.1 never creates a live queue, so this cannot execute at runtime.
+ */
+uint32_t txSubmissionAction(OSObject *target, IOSkywalkTxSubmissionQueue *,
+                            IOSkywalkPacket * const *packets, uint32_t count,
+                            void *refCon)
 {
-    /* Never claim that any packet was transmitted. */
-    return 0;
+    const TxCallbackContext *ctx = static_cast<const TxCallbackContext *>(refCon);
+    if (ctx == nullptr || ctx->target != target)
+        return 0;
+    return itlwm_awdl_datapath::dispatchTxAction(
+        ctx->action, reinterpret_cast<void *const *>(packets), count);
 }
 
 uint32_t txCompletionAction(OSObject *, IOSkywalkTxCompletionQueue *,
@@ -110,10 +124,10 @@ IOSkywalkPacketBufferPool *createPoolLive(OSObject *owner, const char *name,
 __attribute__((noinline, used))
 IOSkywalkTxSubmissionQueue *createTxSubmissionLive(
     IOSkywalkPacketBufferPool *pool, uint32_t capacity, uint32_t queueId,
-    OSObject *owner)
+    OSObject *owner, TxCallbackContext *context)
 {
     return awdlTxSubmissionWithPool(pool, capacity, queueId, owner,
-                                    txSubmissionAction, nullptr, 0);
+                                    txSubmissionAction, context, 0);
 }
 
 __attribute__((noinline, used))
@@ -136,7 +150,8 @@ IOSkywalkRxCompletionQueue *createRxCompletionLive(
 
 class SkywalkBackend : public itlwm_awdl_datapath::Backend {
 public:
-    explicit SkywalkBackend(OSObject *owner) : owner_(owner) {}
+    explicit SkywalkBackend(OSObject *owner)
+        : owner_(owner), txCallbackContext_{owner, {nullptr, nullptr}} {}
 
     void *createPool(const char *name,
                      const itlwm_awdl_datapath::PoolOptions &options) override
@@ -160,16 +175,20 @@ public:
         void *pool, uint32_t capacity, uint32_t queueId,
         const itlwm_awdl_datapath::TxAction &action) override
     {
+        /*
+         * The queue's refCon points into this backend. A future live path
+         * MUST serialize queue teardown and drain callbacks before deleting
+         * the backend. Stage 4.1 leaves all runtime gates closed.
+         */
+        txCallbackContext_.action = action;
 #if ITLWM_AWDL_DATAPATH_LIVE
-        (void)action;
         return createTxSubmissionLive(
             static_cast<IOSkywalkPacketBufferPool *>(pool),
-            capacity, queueId, owner_);
+            capacity, queueId, owner_, &txCallbackContext_);
 #else
         (void)pool;
         (void)capacity;
         (void)queueId;
-        (void)action;
         return nullptr;
 #endif
     }
@@ -245,6 +264,7 @@ public:
 
 private:
     OSObject *owner_;
+    TxCallbackContext txCallbackContext_;
 };
 
 } /* namespace */

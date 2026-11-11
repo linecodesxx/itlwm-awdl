@@ -957,20 +957,22 @@ setVIRTUAL_IF_CREATE(struct apple80211_virt_if_create_data *data)
      * interface must override setMacAddress plus all 63 AWDL slots with the
      * exact signatures and reproduce the 505-slot base chain.
      *
-     * This tree cannot express that layout:
+     * The production headers cannot express that layout:
      *   - include/Airport/IO80211VirtualInterface.h declares
      *     `IO80211VirtualInterface : IOService` with 37 virtuals, while the
      *     real class is an IO80211SkywalkInterface subclass with a 0xfe0
      *     vtable;
-     *   - there is no IO80211AWDLProtocol declaration at all.
+     *   - there is no IO80211AWDLProtocol declaration in the production
+     *     include/Airport tree.
      *
-     * Registering a virtual interface whose vtable is shifted would corrupt
-     * kernel dispatch, so Stage 1 stops before allocation/attach/register.
-     * It does not fabricate an awdl0 interface.
+     * Stage 2 adds AirportItlwmAWDLInterface against the experimental ABI
+     * headers, but it is deliberately not referenced here. This path still
+     * stops before allocation/attach/register and does not fabricate an
+     * awdl0 interface.
      */
     XYLog("%s: AWDL role 6 blocked: IO80211AWDLProtocol (25G332) is "
-          "abstract and its 0x11d8 vtable cannot be reconstructed from the "
-          "headers in this tree; no virtual interface was created\n",
+          "abstract and the Stage 2 ABI class is not wired into this path; "
+          "no virtual interface was created\n",
           __FUNCTION__);
     return kIOReturnUnsupported;
 #endif

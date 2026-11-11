@@ -2708,9 +2708,9 @@ These are **OSSet methods, not TX submission
 callbacks**, despite `+0x1d8` also being
 the offset of the unrelated TX queue
 `packetSubmission(bool)` method.
-A local `OSSet` vtable lookup is still
-required to assign exact operation names
-to these two slots.
+The subsequent 25G332 `OSSet` vtable inspection
+resolved these slots to `OSSet::setObject` and
+`OSSet::removeObject` respectively (section 31).
 
 `IOSkywalkInterface::clientDisconnect(IOService*,uint)`
 at `0xffffff8002b00d06` is an empty return
@@ -2769,10 +2769,9 @@ that requirement.
 
 ### 30.4 Next bounded checks
 
-1. Map `OSSet` object-vptr `+0x1c0` and
-   `+0x1d8` to identify the exact
-   client registry operations used in
-   `handleOpen/handleClose`.
+1. Completed by the follow-up vtable scan:
+   `OSSet +0x1c0/+0x1d8` are `setObject/removeObject`.
+   See section 31.
 2. Scan the **next** ranked caller-function
    slice with `--skip-functions 180` and
    `--max-functions 180`, recording
@@ -2789,3 +2788,117 @@ that requirement.
 **Guardrail:** do not commit Apple proprietary
 KC disassembly; only interpreted call-site
 summaries and read-only research scripts.
+
+
+
+## 31. OSSet client membership verified and 360/2353 direct scan (2026-11-11)
+
+**Evidence:** developer-provided 25G332 KC vtable output for
+`OSSet` and read-only scanner report for ranked
+function indices `[180,360)`, following the previously
+recorded `[0,180)` scan. No disassembly text
+is redistributed.
+
+### 31.1 Exact client-membership calls
+
+Local `OSSet` object-vptr lookup resolved:
+
+- `OSSet +0x1c0` = `OSSet::setObject(OSMetaClassBase const*)`
+  at `0xffffff8000a49760`.
+- `OSSet +0x1d8` = `OSSet::removeObject(OSMetaClassBase const*)`
+  at `0xffffff8000a49860`.
+
+Together with `IOSkywalkInterface::init` and
+`handleOpen/handleClose`, this **confirms**
+that `private+0x0` is an `OSSet` used
+to record/remove clients under an `IOLock`
+at `private+0x10`.
+
+`handleClose`'s `+0x1d8` call is definitively
+`OSSet::removeObject`, **not**
+`IOSkywalkTxSubmissionQueue::packetSubmission`.
+A same-offset match across unrelated classes
+is insufficient evidence for a call graph.
+
+### 31.2 Second direct target scan: no hits, only 15.30% covered
+
+The second local `scan_skywalk_direct_calls.py`
+run used:
+
+- `--families IOSkywalk,IOUserNetwork,IOEthernet`;
+- `--skip-functions 180 --max-functions 180`;
+- `--max-lines 450`.
+
+It reported:
+
+- ranked range `[180,360)` out of 2353
+  candidate named functions;
+- **0 direct call/jmp hits** to the three
+  hard-coded KC addresses
+  `IOWorkLoop::addEventSource`,
+  `IOWorkLoop::removeEventSource`, and
+  `IOSkywalkTxSubmissionQueue::packetSubmission(bool)`;
+- 0 disassembly failures and 0 truncated bodies.
+
+Combined with the previous first batch:
+`[0,360)` scanned **360 of 2353**,
+approximately **15.3%** of selected candidates,
+with 0 observed direct matches. Other symbols,
+remaining functions, indirect calls,
+function pointers, vtable dispatch and
+inlined paths remain **outside this result**.
+
+A zero-hit finding is **not** a no-entry or
+no-future-callback safety guarantee.
+The scan order was ranked by method-name
+priority, so 15.3% is not a uniform or
+representative sample of the KC.
+
+### 31.3 Opt-in indirect-slot candidate scan
+
+The research-only direct-call scanner now also
+supports `--virtual-offsets` for **bounded
+candidate indirect calls** in the same selected
+functions. It recognizes only textual call/jmp
+patterns of the form `call qword ptr [reg + offset]`.
+It outputs the caller name, function/callsite
+address, base register, and requested offset
+**without copying instruction text**. Each
+match is only a **possible indirect slot call**:
+its receiver object's class and virtual target
+are NOT proven by an offset match alone.
+
+The `IOSkywalkTxSubmissionQueue` known virtual
+`+0x1d8` is one relevant candidate offset.
+Other offsets from known event-source and
+WorkLoop virtuals can be included, but a
+same-slot call on another object is a
+false positive until the receiver is traced.
+
+The next pass should map `IOWorkLoop`
+`addEventSource/removeEventSource` virtual
+slots, then run a bounded candidate indirect
+scan on the next ranked group `[360,540)`,
+optionally including `+0x1d8`,
+`+0x120`, `+0x150/+0x158`
+as broad discovery targets. This
+does **not** replace a type-aware reverse
+call-graph analysis. If candidate hits
+appear, request **specific** method bodies
+to trace receiver provenance rather than
+assigning a class by slot number.
+
+### 31.4 Still no lifetime proof
+
+The WorkLoop-driven event-source detach
+mechanism has been identified in the KC;
+however, **no owner-side guaranteed
+queue detach and external TX producer
+stop/drain sequence** has yet been
+demonstrated for the embedded
+`SkywalkBackend::txCallbackContext_`.
+Both experimental flags remain disabled:
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`,
+`ITLWM_AWDL_DATAPATH_LIVE=0`.
+No live kext, EFI or native AWDL queue
+modification is authorized by this research.

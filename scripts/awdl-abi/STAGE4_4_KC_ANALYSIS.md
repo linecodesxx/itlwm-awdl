@@ -1155,11 +1155,14 @@ at `workloop+0x20`. It then associates the gate
 with its workloop and adds it as an event source before
 starting/validating the worker thread.
 
-The local `IOWorkLoop` vptr `+0x118` entry must
-still be resolved to **prove the action-pointer identity**
-directly. The observed arguments and subsequent
-`_maintRequest` behavior support, but do not alone
-pin, the exact callback identity.
+**Confirmed by the subsequent local vtable result:**
+`IOWorkLoop` vptr `+0x118` resolves to
+`IOWorkLoop::_maintRequest(void*,void*,void*,void*)`
+at `0xffffff8000acaac0`. Together with `init()` passing
+this entry into the internal `IOCommandGate::init`,
+this establishes the maintenance action's identity
+in the **actual 25G332 KC**, rather than only by
+comparison with open-source XNU.
 
 ### 19.3 runEventSources traverses under the same gate
 
@@ -1229,3 +1232,97 @@ Keep `ITLWM_AWDL_DATAPATH_LIVE=0`,
 `ITLWM_AWDL_REGISTRATION_ENABLED=0`.
 No kext, EFI or runtime-path changes follow from this
 analysis alone.
+
+
+
+## 20. Maintenance action and queue traversal slots now confirmed (2026-11-11)
+
+**Source:** developer-reported output of the local `inspect_skywalk_vtables.py`
+run, targeting `BootKernelExtensions.kc` on Tahoe 25G332.
+This is direct vtable symbol evidence and completes the
+outstanding slot mapping requested in section 19.5.
+
+| Class | Object-vptr offset | Resolved method | Local KC address |
+|---|---|---|---|
+| `IOWorkLoop` | `+0x118` | `_maintRequest(void*,void*,void*,void*)` | `0xffffff8000acaac0` |
+| `IOWorkLoop` | `+0x120` | `threadMain()` | `0xffffff8000acad50` |
+| `IOWorkLoop` | `+0x128` | `getThread() const` | `0xffffff8000acaf30` |
+| `IOWorkLoop` | `+0x130` | `onThread() const` | `0xffffff8000acaf40` |
+| `IOWorkLoop` | `+0x138` | `inGate() const` | `0xffffff8000acaf60` |
+| `IOEventSource` | `+0x118` | `init(OSObject*,Action)` | `0xffffff8000acc310` |
+| `IOEventSource` | `+0x120` | `checkForWork()` | `0xffffff8000acc380` |
+| `IOEventSource` | `+0x128` | `setWorkLoop(IOWorkLoop*)` | `0xffffff8000acc390` |
+| `IOEventSource` | `+0x130` | `setNext(IOEventSource*)` | `0xffffff8000acc3c0` |
+| `IOEventSource` | `+0x138` | `getNext() const` | `0xffffff8000acc3d0` |
+| `IOEventSource` | `+0x168` | `getWorkLoop() const` | `0xffffff8000acc490` |
+| `IOSkywalkTxSubmissionQueue` | `+0x120` | `checkForWork()` | `0xffffff8002b31746` |
+| `IOSkywalkTxSubmissionQueue` | `+0x128` | inherits `setWorkLoop(IOWorkLoop*)` | `0xffffff8000acc390` |
+| `IOSkywalkTxSubmissionQueue` | `+0x130` | inherits `setNext(IOEventSource*)` | `0xffffff8000acc3c0` |
+| `IOSkywalkTxSubmissionQueue` | `+0x138` | inherits `getNext() const` | `0xffffff8000acc3d0` |
+| `IOSkywalkTxSubmissionQueue` | `+0x168` | inherits `getWorkLoop() const` | `0xffffff8000acc490` |
+| `IOSkywalkTxSubmissionQueue` | `+0x1b8` | `initialize(void*)` | `0xffffff8002b11e8e` |
+| `IOCommandGate` | `+0x1b8` | `init(OSObject*,Action)` | `0xffffff8000ace020` |
+
+Also locally resolved: `IOWorkLoop+0x168` is
+`disableAllInterrupts() const`; `IOWorkLoop+0x1b8`
+is a reserved function; `IOEventSource+0x1b8` is a null
+slot in this scan. Those are **not** interchangeable
+with the specialized TX queue's `+0x1b8`.
+
+### Verified full gate path for workloop-driven queue activity
+
+```text
+IOWorkLoop::init()
+  -> IOCommandGate::init(owner=workloop,
+                         action=IOWorkLoop::_maintRequest)
+  -> gate attached at workloop+0x20
+
+IOWorkLoop::removeEventSource(txQueue)
+  -> commandGate::runCommand(operation=1, txQueue)
+  -> commandGate::runAction(saved _maintRequest, ...)
+  -> IOWorkLoop::_maintRequest
+  -> find/unlink txQueue, setWorkLoop(nullptr), setNext(nullptr), release
+
+IOWorkLoop::runEventSources()
+  -> closeGate()
+  -> txQueue::checkForWork() while it is in event-source list
+  -> openGate()
+```
+
+The local `_maintRequest` and `runEventSources` bodies,
+combined with the vtable mapping, support a **synchronous
+barrier for workloop-list-driven entries on that same
+workloop**, assuming successful removal and no
+subsequent re-attachment.
+
+### Unresolved critical direct path
+
+The queue's `packetSubmission(bool)` can be invoked through
+other code paths, not just the `runEventSources` scan.
+`IOWorkLoop::removeEventSource` cannot by itself prove
+that such external callers have stopped, or that their
+callbacks no longer hold the borrowed `refCon`.
+
+The Skywalk callback trampoline dereferences
+`TxCallbackContext` **before** attempting admission through
+its `CallbackGate`. Therefore even a closed gate with
+`activeCount()==0` cannot make premature context deletion
+safe. The owner-side direct TX stop-and-drain protocol
+is the remaining lifetime blocker before any live test.
+
+### Next bounded read-only target
+
+The newly identified `IOSkywalkTxSubmissionQueue::initialize(void*)`
+at `0xffffff8002b11e8e` is a useful next method to
+inspect for workloop/producer attachment. Also inspect
+the queue's `enable()` and `disable()` paths to see
+whether they create/remove workloop event-source registration
+or only change queue state.
+
+Do not assume `initialize` calls `addEventSource`
+until its body demonstrates this. Only the owner's
+attach/detach callsites and the direct TX producer
+lifecycle can ultimately close this gap.
+
+**No modification to the kext source, runtime flags,
+EFI, or native interface registration.**

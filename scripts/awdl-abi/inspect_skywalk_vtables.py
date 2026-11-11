@@ -8,7 +8,7 @@ It never builds, loads, installs or calls the actual kernel code.
 
 Example:
   python3 scripts/awdl-abi/inspect_skywalk_vtables.py
-  python3 scripts/awdl-abi/inspect_skywalk_vtables.py --offsets 0x140,0x148,0x198,0x1e0,0x168
+  python3 scripts/awdl-abi/inspect_skywalk_vtables.py --offsets 0x140,0x148,0x158,0x198,0x1e0,0x168
 """
 import argparse
 import os
@@ -25,7 +25,7 @@ CLASSES = (
     "IOSkywalkTxCompletionQueue",
     "IOSkywalkRxCompletionQueue",
 )
-DEFAULT_OFFSETS = "0x140,0x148,0x198,0x1e0,0x160,0x168"
+DEFAULT_OFFSETS = "0x140,0x148,0x158,0x198,0x1e0,0x160,0x168"
 
 
 def demangle(name):
@@ -61,6 +61,8 @@ def main():
     kc = KC(args.kc)
     print("KC:", args.kc)
     print("Offsets are measured from the C++ vptr (entry index = offset / 8).")
+    print("Raw __ZTV symbol offsets include two 8-byte metadata entries;")
+    print("e.g. __ZTV+0x168 corresponds to object-vptr+0x158 (slot 43).")
     found = 0
     for cls in (v.strip() for v in args.classes.split(",") if v.strip()):
         rows = kc.vtable(cls)

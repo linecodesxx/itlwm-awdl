@@ -249,3 +249,27 @@ python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
 ```
 
 Do not add extracted proprietary disassembly to public GitHub; share relevant details privately. No production kext sources or runtime gates changed.
+
+## Finalize symbol extraction completed (developer-reported, 2026-11-11)
+
+Read-only collector command with `--methods finalize --max-functions 10
+--max-lines 350` completed successfully against local
+`BootKernelExtensions.kc` (25G332). Exactly five methods were matched:
+
+| Method | Reported disassembly lines |
+|---|---:|
+| `IOSkywalkTxSubmissionQueue::finalize()` | 32 |
+| `IOSkywalkTxCompletionQueue::finalize()` | 30 |
+| `IOSkywalkRxCompletionQueue::finalize()` | 33 |
+| `IOSkywalkPacketQueue::finalize()` | 35 |
+| `IOSkywalkPacket::finalize()` | 23 |
+
+Local output: `/tmp/awdl-skywalk-finalize.txt`.
+
+**Only successful extraction and method names/counts are confirmed.**
+The contents of this file and the previously generated
+`/tmp/awdl-skywalk-packet-lifetime.txt` are still needed to analyze
+callback quiescence, TX/RX ownership, packet recycling and teardown.
+The presence of `finalize()` does not itself prove draining or
+safe deletion of a callback context. No runtime gates or driver source
+were changed.

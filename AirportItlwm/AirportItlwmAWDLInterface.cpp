@@ -254,31 +254,30 @@ buildRegistrationInfo(void *buffer, size_t size) const
     memset(info, 0, sizeof(*info));
 
     /*
-     * These are the values initRegistrationInfo() writes on 25G332, with the
-     * AWDL corrections verified in AppleBCMWLANProximityInterface:
+     * These values reproduce the AWDL-specific patches made by
+     * AppleBCMWLANCore::createProxInterface() on the 25G332 KC, followed
+     * by ProximityInterface::start()'s 1428-byte MTU patch.
      *
-     *   - start() patches both MTU fields to 0x594 (1428), not 0x5dc;
-     *   - getBSDNamePrefix() returns "awdl";
-     *   - headroom (+0x3c) stays 0 because the base init zeroes it and
-     *     start() does not patch it;
-     *   - media (+0x28) and minimum packet size (+0x44) keep the base
-     *     fallbacks because start() does not patch them.
+     * This isolated buffer is NEVER passed to Skywalk registration.
+     * +0x14 is supported-media capacity, +0x24 is initial active media,
+     * +0x28 is initial current media and +0x3c is TX headroom.
+     * +0x40=4 is the non-power-reset branch (the other observed value is 6).
+     * A live path must handle the power-state condition explicitly.
      *
-     * The prefix points at a static string literal, so it stays valid for as
-     * long as the buffer exists. A live path must still confirm that the
-     * controller wants the same family/subfamily/media values.
+     * The prefix points at a static string literal valid for this buffer.
      */
     info->prefix.version = kRegistrationVersion;
     info->prefix.size = kEthernetRegistrationSize;
     info->prefix.interfaceFamily = 2;
-    info->prefix.interfaceSubFamily = 0;
-    info->prefix.maxSize = 0x100;
-    info->prefix.reserved2 = 0x22;
+    info->prefix.interfaceSubFamily = itlwm_awdl_25g332::kAwdlInterfaceSubFamily;
+    info->prefix.supportedMediaCapacity = itlwm_awdl_25g332::kAwdlMediaCapacity;
+    info->prefix.initialActiveMedia = itlwm_awdl_25g332::kAwdlInitialActiveMedia;
     info->prefix.initialMedia = itlwm_awdl_25g332::kAwdlInitialMedia;
     info->prefix.bsdNamePrefix =
         reinterpret_cast<uintptr_t>(itlwm_awdl_25g332::kAwdlBsdNamePrefix);
     info->prefix.bsdUnitNumber = 0;
     info->prefix.txDataOffset = itlwm_awdl_25g332::kAwdlTxDataOffset;
+    info->prefix.awdlOptions = itlwm_awdl_25g332::kAwdlOptionsDefault;
     info->prefix.minPacketSize = itlwm_awdl_25g332::kAwdlMinPacketSize;
     info->prefix.maxTransferUnit = itlwm_awdl_25g332::kAwdlMaxTransferUnit;
     info->prefix.maxTransferUnit2 = itlwm_awdl_25g332::kAwdlMaxTransferUnit;
@@ -361,10 +360,15 @@ startLifecycle()
              */
             if (info->prefix.version != kRegistrationVersion ||
                 info->prefix.size != kEthernetRegistrationSize ||
-                info->prefix.maxSize > kRegistrationMaxSizeField ||
+                info->prefix.supportedMediaCapacity != itlwm_awdl_25g332::kAwdlMediaCapacity ||
+                info->prefix.supportedMediaCapacity > kRegistrationMaxSizeField ||
+                info->prefix.interfaceSubFamily != itlwm_awdl_25g332::kAwdlInterfaceSubFamily ||
+                info->prefix.initialActiveMedia != itlwm_awdl_25g332::kAwdlInitialActiveMedia ||
+                info->prefix.initialMedia != itlwm_awdl_25g332::kAwdlInitialMedia ||
                 info->prefix.maxTransferUnit != itlwm_awdl_25g332::kAwdlMaxTransferUnit ||
                 info->prefix.maxTransferUnit2 != itlwm_awdl_25g332::kAwdlMaxTransferUnit ||
                 info->prefix.txDataOffset != itlwm_awdl_25g332::kAwdlTxDataOffset ||
+                info->prefix.awdlOptions != itlwm_awdl_25g332::kAwdlOptionsDefault ||
                 info->prefix.bsdNamePrefix == 0) {
                 result = kIOReturnBadArgument;
             } else {
@@ -447,16 +451,14 @@ stopLifecycle()
     }
 
     /*
-     * A deferred teardown belongs to whichever transition is finishing. If
-     * this stop sees it first (for example after a failed start rolled back
-     * to Initialized), finish it here and drop the lifecycle retain once.
+     * A deferred teardown belongs EXCLUSIVELY to the in-flight transition
+     * that owns the Starting/Prepared/Stopping state. This stop() invocation
+     * must never clear the record or release its retain: startLifecycle()
+     * may still be using this object in its unlocked window.
      */
     if (record->teardownPending) {
-        bool releaseReference = clearRecordLocked(record);
         IOLockUnlock(lock);
-        if (releaseReference)
-            this->release();
-        return kIOReturnSuccess;
+        return kIOReturnBusy;
     }
 
     if (record->state == kLifecycleInitialized) {

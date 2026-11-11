@@ -781,3 +781,124 @@ Before a Stage 5 live callback, independently establish:
    future entry is ruled out.
 4. Preserve the existing Stage 4 fail-closed
    `ITLWM_AWDL_DATAPATH_LIVE=0` and registration disabled.
+
+
+
+## 16. Base queue initialization and IOWorkLoop event source delegation (2026-11-11)
+
+**Source:** developer-uploaded `awdl-skywalk-workloop-lifetime.txt`:
+the 25G332 vtable mapping and the bodies of `IOSkywalkPacketQueue::initWithPool`,
+`IOWorkLoop::{addEventSource,removeEventSource,signalWorkAvailable}`,
+and `IOEventSource::signalWorkAvailable`. Only interpreted behavior is
+recorded; do not publish the KC disassembly.
+
+### 16.1 Virtual slot names checked
+
+| Class | Object-vptr offset | Method | 25G332 address |
+|---|---|---|---|
+| `IOSkywalkPacketQueue` | `0x230` | `initWithPool(...)` | `0xffffff8002b0dbc8` |
+| `IOSkywalkTxSubmissionQueue` | `0x230` | inherits base `initWithPool(...)` | `0xffffff8002b0dbc8` |
+| `IOSkywalkPacketQueue` | `0x1d8` | `packetSubmission(bool)` | `0xffffff8002b0ded4` |
+| `IOSkywalkTxSubmissionQueue` | `0x1d8` | `packetSubmission(bool)` | `0xffffff8002b31d68` |
+| `IOSkywalkPacketQueue` | `0x1e0` | `sendNotification(uint)` | `0xffffff8002b0dee0` |
+| `IOSkywalkTxSubmissionQueue` | `0x1e0` | `sendNotification(uint)` | `0xffffff8002b31afe` |
+
+These resolve the previously unnamed virtual calls in
+`TxSubmissionQueue::checkForWork()`. In particular,
+queue vptr `+0x1d8` can invoke `packetSubmission(bool)` and hence
+the driver's packet callback via `legacyDequeue()`.
+
+### 16.2 Base queue initializer saves the borrowed refCon
+
+`IOSkywalkPacketQueue::initWithPool`, address
+`0xffffff8002b0dbc8`, validates a queue-type selector
+between 1 and 3 (inclusive) and an integer option less than
+`0x10000`. It then calls a superclass initializer via an
+indirect virtual and, on success:
+
+- Stores the **exact refCon pointer** passed on the stack
+  (the final argument) at **`queue+0x58`**.
+- Stores `queue+0xac =` the `r8d` capacity passed to this
+  initializer. This confirms the field used for packet-table
+  sizing, completion pointer-buffer sizing, and the strict
+  `count < queue+0xac` enqueue check.
+- Writes queue mode/parameters at `+0xb4`, `+0xa8`
+  and `+0xb0`.
+- Stores the pool pointer at `queue+0x50` and invokes
+  its virtual `+0x20` (consistent with retain). The
+  base queue `free()` later releases this pool pointer.
+- Initializes event/queue state, including `+0x28`
+  disabled and `+0xcd` set.
+
+Crucially, the **refCon is only stored as an untyped pointer**
+in this initializer. There is no visible retain of the backend
+context; the eventual owner must guarantee that it outlives
+every callback, including calls that enter after a gate
+closes. The callback action itself is supplied to the
+superclass IOEventSource initialization; the exact setter
+needs inspection before assigning its storage field
+from this body alone.
+
+### 16.3 WorkLoop add/remove are delegated operations
+
+`IOWorkLoop::addEventSource(IOEventSource*)` at
+`0xffffff8000acaf80` is more than a direct list insertion:
+it performs special-case checks before dispatching via
+the object at `workLoop+0x20` and a virtual `+0x1c0`
+with an operation argument of 0.
+
+`IOWorkLoop::removeEventSource(IOEventSource*)` at
+`0xffffff8000acb070` tail-calls **that same virtual
+`+0x1c0`** on `*(workLoop+0x20)`, but passes an
+operation argument of **1**.
+
+The methods' wrappers do not themselves show the
+actual attach/detach algorithm or a callback-drain wait.
+The class of the `workLoop+0x20` object and its virtual
+`+0x1c0` target must be resolved against local KC
+vtable evidence. Until then, `removeEventSource` cannot
+be asserted to be a safe `refCon` lifetime barrier.
+
+There is also **no evidence in the supplied queue
+initializer** that it itself calls `addEventSource`:
+that is a higher-level owner operation which must be traced.
+
+### 16.4 WorkLoop is explicitly woken for pending work
+
+`IOEventSource::signalWorkAvailable()` at
+`0xffffff8000acc880` loads the workloop pointer at
+`eventSource+0x30` and makes an indirect call via
+its virtual `+0x170`.
+
+`IOWorkLoop::signalWorkAvailable()` at
+`0xffffff8000acb290` takes a spinlock when its lock
+field is present, marks pending work at `workLoop+0x38`,
+and invokes `_thread_wakeup_thread` on its workloop
+thread pointer `+0x30`; it releases the spinlock
+afterwards. The shown method does **not** wait for a
+callback, drain events, or release an event-source refCon.
+
+These two bodies directly confirm a **deferred workloop
+wake-up path**, which must be considered alongside direct
+submission callbacks during teardown.
+
+### 16.5 Exact remaining proof obligations
+
+1. Resolve the class of `workLoop+0x20` and its
+   virtual `+0x1c0` operation with local KC vtables
+   (including possible `IOCommandGate`).
+2. Trace where the queue owner calls `addEventSource`
+   and `removeEventSource` and whether the latter
+   synchronously prevents **future** `checkForWork` and
+   direct `packetSubmission` callbacks.
+3. Verify queue/owner reference ordering, shared
+   workloop gate serialization and callback-drain
+   semantics before freeing `SkywalkBackend::txCallbackContext_`.
+4. Do not assume `removeEventSource` alone handles
+   deferred pool tasks from `checkInPacketQueue`.
+5. Keep all AWDL runtime gates off, no kext installation,
+   packet delivery or interface registration.
+
+**Evidence status:** Native packet return and stored callback
+parameters are verified. A no-future-entry guarantee is
+**not** verified.

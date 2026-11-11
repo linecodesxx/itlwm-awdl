@@ -67,6 +67,8 @@ DEFAULT_METHODS = (
     "disposePacketBuffer",
     "runAction",
     "runCommand",
+    "_maintRequest",
+    "runEventSources",
     "setWorkLoop",
     "workLoop",
     "purgePackets",

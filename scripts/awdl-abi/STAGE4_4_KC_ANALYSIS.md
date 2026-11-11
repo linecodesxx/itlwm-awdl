@@ -1609,3 +1609,159 @@ and `IOEventSource::free`, without claiming
 to know their call graph from names alone.
 Keep `ITLWM_AWDL_REGISTRATION_ENABLED=0`
 and `ITLWM_AWDL_DATAPATH_LIVE=0`.
+
+
+
+## 23. QueueSet ownership and NetworkInterface registration lifecycle (2026-11-11)
+
+**Evidence:** local Tahoe 25G332 disassembly supplied by the developer
+for `IOSkywalkQueueSet::initWithQueues`,
+both `IOSkywalkNetworkInterface::registerNetworkInterface`
+overloads, and `deregisterNetworkInterface`. The original
+collector matched 10 QueueSet symbols, but a 6-function limit
+captured only the real `initWithQueues` plus five non-code
+`kalloc_type_view` symbols; `initialize`, `setEnable`
+and `finalize` have **NOT** yet been reviewed. These
+conclusions intentionally exclude that missing evidence.
+
+### 23.1 QueueSet stores and retains queue pointers
+
+`IOSkywalkQueueSet::initWithQueues` at
+`0xffffff8002b18406`:
+
+- Validates a queue-pointer array, a nonzero bounded
+  queue count, and a `QueueSetInfo_s` pointer.
+- Iterates the supplied queues and uses virtual `+0x218`
+  to inspect a queue-specific type/classification value.
+  Maintains per-category counts at `QueueSet+0x60/+0x68/
+  +0x70/+0x78`, with distinct allocation arrays
+  rooted at `+0x20/+0x28/+0x30/+0x38`.
+- Allocates an all-queues pointer array at
+  `QueueSet+0x18`, indexed using total count
+  stored at `QueueSet+0x58`.
+- For each queue, explicitly calls
+  `IOSkywalkPacketQueue::setQueueSet(this)`
+  (at `0xffffff8002b0e038`),
+  stores its pointer in the all-queues array
+  and appropriate categorized array, and invokes
+  the queue virtual `+0x20` (OSObject `retain()`).
+- Optionally validates the WMM scheduling capability
+  and allocates queue-set nexus info.
+
+This is **positive evidence that QueueSet retains the
+queue objects** after creation; it is more than a
+borrowed-pointer container. However, the reciprocal
+`IOSkywalkQueueSet::finalize/free` release order,
+per-queue disable/finalize, and WorkLoop detach
+are not yet established.
+
+**Parsing caution:** the local disassembler continued
+beyond the function return into an inline jump table,
+so the last apparent “unknown instructions” are likely
+table *data*, not meaningful execution steps.
+
+### 23.2 Interface registration constructs a queue-owning graph
+
+The overload
+`IOSkywalkNetworkInterface::registerNetworkInterface(
+RegistrationInfo*,IOSkywalkPacketQueue**,unsigned,
+pool,pool,unsigned)`
+at `0xffffff8002b0f0d6`:
+
+1. Checks whether the supplied queues support the
+   WMM scheduling model.
+2. Creates an `IOSkywalkQueueSet` through
+   `IOSkywalkQueueSet::createWithQueues`.
+3. Constructs an `IOSkywalkLogicalLink` through
+   `IOSkywalkLogicalLink::createWithQueueSet`.
+4. Forwards this graph to the other registration
+   overload at `0xffffff8002b0f204`.
+5. Releases temporary owned references to the newly
+   constructed graph after the call.
+
+The `registerNetworkInterface(..., IOSkywalkLogicalLink*,
+pool,pool,unsigned)` overload validates a
+`RegistrationInfo` version and size, interface
+options and pool arguments, copies registration
+metadata, attaches a default logical link,
+maintains an ordered set of links, and **retains**
+selected input packet-buffer pools into the
+interface fields `+0x98/+0xa0`.
+
+This establishes concrete parent/child structure:
+
+```text
+NetworkInterface
+  -> LogicalLink (default)
+       -> QueueSet
+            -> IOSkywalkPacketQueue* (retained by QueueSet)
+  -> packet-buffer pools (retained by NetworkInterface)
+```
+
+**These two bodies show no direct
+`IOWorkLoop::addEventSource(txQueue)`**. The
+QueueSet/LogicalLink methods and surrounding
+registration owners may still do so.
+
+### 23.3 Deregistration tears down link and pool references
+
+`IOSkywalkNetworkInterface::deregisterNetworkInterface`
+at `0xffffff8002b0ee9c`:
+
+- Calls `removeNonDefaultLogicalLinks()` when
+  a logical-link collection is present.
+- Iterates existing queue sets to remove steering
+  rules under a qualifying condition.
+- Calls `IOSkywalkLogicalLink::setInterface(nullptr)`
+  on the default link when present.
+- Releases the ordered logical-link collection
+  at `interface+0xc8`, setting it to null.
+- Releases and nulls references at
+  `interface+0xa0`, `+0x98`, `+0x90`,
+  `+0xd0`; frees registration-metadata
+  backing storage through `interface+0xc0`.
+
+**Important limit:** this method does **not**
+directly call `IOWorkLoop::removeEventSource`,
+`IOSkywalkTxSubmissionQueue::disable`, or
+`TxSubmissionQueue::purgePackets` in its shown body.
+Those effects may happen through `LogicalLink`/
+`QueueSet` release/finalize paths, so asserting a
+missing cleanup bug in Apple Skywalk would be
+unjustified until the child teardown is mapped.
+
+### 23.4 Read-only collector fix
+
+The old function filter accepted demangled names
+belonging to an owner class even when the mangled
+symbol actually referred to **static metadata
+local to a function** (e.g.
+`__ZZN17IOSkywalkQueueSet14initWithQueues...kalloc_type_view`).
+That made `--max-functions 6` silently exclude
+later real methods. The read-only collector now:
+
+- restricts candidates to normal Itanium C++
+  `__ZN...` method symbols (which also includes
+  `__ZNK...` const methods);
+- excludes `__ZZN...` local static symbols;
+- supports `IOSkywalkLogicalLink` as an
+  additional `--classes` filter.
+
+No live driver or kext code was modified.
+
+### 23.5 Next research: actual parent/child teardown
+
+First inspect QueueSet `initialize`, `setEnable`,
+`finalize`, `free` and LogicalLink
+`initialize`, `finalize`, `free`,
+`setInterface` (where present). Map
+whether they release or disable TX submission
+queues, whether they call `removeEventSource`,
+and their ordering. Only then trace all direct
+`packetSubmission` callers and prove that
+`TxCallbackContext` outlives every possible
+callback entry.
+
+**Do not enable AWDL runtime registration or
+datapath while these ownership constraints
+remain unproven.**

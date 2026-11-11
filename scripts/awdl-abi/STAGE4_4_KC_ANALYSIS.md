@@ -111,3 +111,90 @@ With these incomplete, **TX/RX live datapath remains blocked**.
 Additional local collection reported 14 symbol matches, including 32 lines of TX submission queue `free()`, 31 lines of TX completion queue `free()`, 32 lines of RX completion queue `free()`, 20 lines of base queue `free()`, 62 lines of pool `free()`, 91 lines of `enqueuePacketsForNetworking()`, 65 lines of `enqueuePacketsForKPipe()`, and 27 lines of `resetABFS()`. The actual **second disassembly file is not yet available for review**, so we cannot assert anything about their control flow or drain behavior.
 
 **Critical ABI offset distinction:** In the `disable()` wrappers the indirect call operand is based on the raw `__ZTV` symbol (`lea ... __ZTV20IOSkywalkPacketQueue`), which includes two 8-byte Itanium metadata entries. The tool's `--offsets` switch instead takes offsets from the C++ **vptr**. Thus raw `__ZTV+0x168` maps to callable vptr `+0x158` (slot 43), **not** the printed `getWorkLoop()` at vptr `+0x168` (slot 45). Query this corrected slot before interpreting the disable target.
+
+
+## 9. Review of RX and free() from second local 25G332 disassembly
+
+**Source:** developer-provided `awdl-skywalk-remaining-evidence.txt`,
+433 lines (13 substantive function bodies and allocation-view metadata),
+2026-11-11. The report below paraphrases the supplied control flow; it does
+not redistribute bulk proprietary disassembly.
+
+### 9.1 Specialized free() paths
+
+| Method | Evidenced operations | NOT established |
+|---|---|---|
+| `TxSubmissionQueue::free`, `0xffffff8002b11be2` | Destroys `IOSkywalkPacketTable` at `+0xe8`, frees metadata allocations at `+0x100` and `+0x68`, then tail-calls base `IOSkywalkPacketQueue::free` through raw vtable `+0xa0` | No explicit gate/callback drain, unregister or disable in this specialized method |
+| `TxCompletionQueue::free`, `0xffffff8002b17a94` | Calls `this->vptr+0x1c0` **first**, frees pointer-array storage at `+0xe0` using `(+0xac) * 8` bytes, metadata at `+0xf8`, recursive lock at `+0x108`, then calls base free | `+0x1c0` target is **unresolved**; do not assume it drains callbacks. Storage size makes `+0xac` a per-queue pointer-buffer allocation count, but whether it exactly matches the `withPool` capacity parameter still needs `initWithPool` inspection |
+| `RxCompletionQueue::free`, `0xffffff8002b13f4a` | Destroys `IOSkywalkPacketTable` at `+0xe8`; releases object at `+0xf8` using its vptr `+0x28`; frees allocation at `+0x100`; calls base free | No explicit callback-drain or source-queue removal in this specialized method |
+| `IOSkywalkPacketQueue::free`, `0xffffff8002b0dc8e` | Clears `+0x70`, `+0x60`, releases pool pointer `+0x50` through vptr `+0x28`, clears it, then tail-calls superclass free | The shown body does not prove the event source was removed from the workloop, and it does not itself prove callbacks are quiescent |
+| `IOSkywalkPacketBufferPool::free`, `0xffffff8002b0a45c` | Calls `_thread_call_cancel_wait` and `_thread_call_free` on pool's `+0xb0` thread call, then calls `releaseAllPackets` and `releaseAllMemorySegments`, releases auxiliary objects and frees locks | `cancel_wait` applies to this pool's thread call, **not** automatically to queue callbacks. Pool freeing is a potentially unsafe fallback if outstanding queues or packets remain |
+
+**Critical lifetime implication:** The presence of a destructor/free chain
+does **not** establish that `disable(); release();` waits for any callback
+holding the backend's borrowed `refCon`. In Stage 4.2 the callback gate
+never arms, so the live queue cannot be created at all. Keep this disabled.
+
+The repeated `__ZTV20IOSkywalkPacketQueue + 0xa0` tail call in specialized
+free() functions is measured from the raw table symbol, therefore maps to
+object-vptr `+0x90` (slot 18). This must not be mixed up with
+object-vptr `+0xa0`.
+
+### 9.2 RX array: Networking
+
+`IOSkywalkRxCompletionQueue::enqueuePacketsForNetworking` at
+`0xffffff8002b1433c` iterates the requested array:
+
+1. Obtains native packet handle at `IOSkywalkPacket+0x28`.
+2. Links the native handles through `_kern_packet_set_next`, tracking head
+   and tail.
+3. Calls `IOSkywalkPacket::getDataLength`, `completeWithQueue(queue,2,0)`,
+   then `disposePacket` for each wrapper; optionally calls BPF tap.
+4. Accumulates byte counts and calls `_kern_netif_queue_rx_enqueue` once
+   with the native list, count and flag `1`.
+5. Returns **accumulated bytes**; the displayed function does **not**
+   branch on the `_kern_netif_queue_rx_enqueue` return value.
+
+**Interpretation limit:** `disposePacket()` is performed before the native
+list is handed to networking; this is not proof of a use-after-free because
+the Skywalk wrapper and the native `kern_packet_t` may have distinct
+ownership. We must inspect `disposePacket()`, `completeWithQueue()` and
+the networking enqueue ownership contract before treating the return as
+fully acknowledged. The function's return is **not** a number of packets.
+
+### 9.3 RX array: KPipe
+
+`IOSkywalkRxCompletionQueue::enqueuePacketsForKPipe` at
+`0xffffff8002b1447e`:
+
+1. Iterates wrappers and calls `getSourceQueue`,
+   `getDataLength`, `completeWithQueue(queue,2,0)`.
+2. Advances/normalizes the index in the packet table at `+0xe8` by the
+   **packet count** and updates statistics.
+3. Calls a virtual method at queue vptr `+0x1e0` with zero argument.
+   Prior KC vtable mapping resolves this to
+   `IOSkywalkRxCompletionQueue::sendNotification(uint)`.
+4. Returns accumulated **byte count**, not accepted packet count.
+
+Unlike the Networking path, the shown KPipe function does not call
+`disposePacket()` or `_kern_netif_queue_rx_enqueue`. Inspect source
+queue/table ownership before exposing KPipe.
+
+### 9.4 resetABFS is statistics/scheduling reset, not a drain
+
+`IOSkywalkPacketQueue::resetABFS()` at `0xffffff8002b0de62`
+clears fields in `this+0x68` and restores
+`_gIOSkywalkABFSMinLimit` values while preserving selected fields.
+The supplied 27 instructions show no callback wait, queue detach or packet
+release. Therefore, **resetABFS must not be interpreted as callback
+quiescence or packet return**.
+
+### 9.5 Still blocked
+
+- Identify `TxCompletionQueue::vptr+0x1c0`, and base disable raw
+  `__ZTV20IOSkywalkPacketQueue+0x168` = object-vptr `+0x158`.
+- Inspect `IOSkywalkPacket::{completeWithQueue,disposePacket}` and pool
+  `deallocatePacket(s)`, `releaseAllPackets`.
+- Review `initWithPool` and the source-queue/table handoff to distinguish
+  capacity, packet-buffer ownership and actual callback quiescence.
+- Real `AWDL` and live datapath remain **disabled**.

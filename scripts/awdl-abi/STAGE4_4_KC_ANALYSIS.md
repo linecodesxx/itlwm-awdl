@@ -1092,3 +1092,140 @@ Skywalk owner calls to `removeEventSource`.
    before these invariants are proven.
 5. Keep `ITLWM_AWDL_DATAPATH_LIVE=0` and
    AWDL registration disabled. No live packet processing.
+
+
+
+## 19. Local workloop maintenance verified in 25G332 (2026-11-11)
+
+**Source:** developer-uploaded local Tahoe 25G332 KC disassembly for
+`IOWorkLoop::_maintRequest()` (176 instructions, address
+`0xffffff8000acaac0`), `IOWorkLoop::init()` (111 instructions,
+`0xffffff8000aca680`) and `IOWorkLoop::runEventSources()`
+(181 instructions, `0xffffff8000acb650`). This section records
+analysis only, not any extracted Apple KC instructions.
+
+### 19.1 Remove operation=1 confirmed in the local binary
+
+`IOWorkLoop::_maintRequest(owner, operation, source, ...)`
+takes `operation=1` from
+`IOWorkLoop::removeEventSource(source)` via the internal
+`IOCommandGate::runCommand -> runAction` path.
+
+In the local KC, the remove branch:
+
+1. Calls event-source virtual `+0x168` to inspect the source's
+   workloop association. If absent, it can return 0 without
+   modifying either event chain.
+2. Calls `IOStatistics::detachWorkLoopEventSource`
+   on the associated bookkeeping.
+3. Finds the source in one of the workloop's linked chains,
+   including a primary chain rooted at `workloop+0x18`
+   and a special secondary chain via `workloop+0x40`.
+   Uses the source's virtual `+0x138` to traverse
+   and `+0x130` to relink around it.
+4. On the successful found/unlink path, calls source vptr
+   `+0x128` with `nullptr` (consistent with
+   `IOEventSource::setWorkLoop(nullptr)`), then source
+   vptr `+0x130` with `nullptr`
+   (consistent with `IOEventSource::setNext(nullptr)`).
+5. Calls source virtual `+0x28` (OSObject `release()`),
+   sets workloop bookkeeping byte `+0x39` bit 0
+   (rescan/restart flag) and returns success 0.
+
+A linked-source search failure can return `0xe00002c2`.
+Because an already-unattached source can also return 0,
+a bare zero status **does not by itself prove a source
+was previously attached**. It should be paired with a
+known successful attach and appropriate owner state.
+
+The add operation (`operation=0`) retains the source,
+associates it with the workloop, links it into an event
+chain, updates statistics and sets the same rescan flag.
+This is consistent with the public XNU `_maintRequest`
+description but is now independently backed by local
+25G332 control flow.
+
+### 19.2 Workloop's own command gate is created in init
+
+`IOWorkLoop::init()` obtains an `IOCommandGate` from
+its metaclass, initializes it with the workloop object
+as owner plus a function pointer loaded from the
+workloop vtable at `+0x118`, and stores that gate
+at `workloop+0x20`. It then associates the gate
+with its workloop and adds it as an event source before
+starting/validating the worker thread.
+
+The local `IOWorkLoop` vptr `+0x118` entry must
+still be resolved to **prove the action-pointer identity**
+directly. The observed arguments and subsequent
+`_maintRequest` behavior support, but do not alone
+pin, the exact callback identity.
+
+### 19.3 runEventSources traverses under the same gate
+
+`IOWorkLoop::runEventSources()`:
+
+- calls workloop vptr `+0x180`, already resolved
+  as `IOWorkLoop::closeGate()` (gate enter);
+- scans the active source list rooted at
+  `workloop+0x18`, calling each source virtual
+  `+0x120` (expected `checkForWork()`) and
+  `+0x138` (expected `getNext()`);
+- checks flag `workloop+0x39 & 1` and restarts
+  the scan after event-list modifications;
+- ultimately invokes workloop vptr `+0x178`,
+  mapped as `IOWorkLoop::openGate()` (gate exit).
+
+This is stronger evidence for **same-workloop-serialized
+event-source removal** than the earlier presence of a
+generic gate. A successful removal from the workloop
+chain, executed under this gate, prevents a subsequent
+`runEventSources` traversal from selecting that source
+unless it is re-registered.
+
+### 19.4 Precisely what is and is not proven
+
+**Proven in the local KC (subject to matching vtable offsets):**
+
+- a real synchronous remove handler that unlinks the
+  source, nulls its workloop and successor links and
+  releases the workloop's reference;
+- WorkLoop list traversal and maintenance actions are
+  serialized by its gate;
+- source-list changes request a scan restart.
+
+**Still NOT proven for experimental AWDL:**
+
+- that a future `SkywalkBackend` calls
+  `IOWorkLoop::removeEventSource(txQueue)` at all,
+  and handles failures/absence of registration correctly;
+- that **direct** non-workloop `packetSubmission()`
+  or other calls cannot invoke `legacyDequeue()`
+  after successful detach;
+- that all callbacks that have already received
+  `refCon = &SkywalkBackend::txCallbackContext_`
+  have finished before the backend is deleted;
+- that closing the embedded `CallbackGate`
+  suffices: the trampoline **dereferences the context
+  before attempting its admission gate**.
+
+This is a concrete advance toward an owner-side
+`stop producers -> detach under workloop gate ->
+verify no future entries -> drain admitted calls ->
+release queues -> free context` protocol, but that
+protocol has **not** yet been implemented or proven.
+
+### 19.5 Next bounded inspection
+
+Map the vptr offsets used directly above:
+`IOWorkLoop+0x118`,
+`IOEventSource+0x120/+0x128/+0x130/+0x138/+0x168`,
+`IOSkywalkTxSubmissionQueue+0x120/+0x128/+0x138/+0x168`,
+and `IOCommandGate+0x1b8`.
+Then investigate owner-side queue registration/teardown
+and possible external packet-submission callers.
+
+Keep `ITLWM_AWDL_DATAPATH_LIVE=0`,
+`ITLWM_AWDL_REGISTRATION_ENABLED=0`.
+No kext, EFI or runtime-path changes follow from this
+analysis alone.

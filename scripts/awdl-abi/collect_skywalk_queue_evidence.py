@@ -144,7 +144,8 @@ def main():
     method_set = set(methods)
     items = []
     for mangled, decoded in names.items():
-        cls = next((f for f in selected_classes if f + "::" in decoded), None)
+        cls = next((f for f in selected_classes
+                    if decoded.startswith(f + "::")), None)
         meth = method_name(decoded)
         if cls is None or (not args.all_methods and meth not in method_set):
             continue

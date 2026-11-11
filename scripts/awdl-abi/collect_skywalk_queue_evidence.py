@@ -58,6 +58,7 @@ DEFAULT_METHODS = (
     "completeWithQueue",
     "disposePacket",
     "finalize",
+    "completePreparedPacket",
     "checkOutPacketQueue",
     "flushAllPackets",
     "disposePacketBuffer",

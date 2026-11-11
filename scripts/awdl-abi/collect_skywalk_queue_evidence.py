@@ -68,7 +68,7 @@ def demangle(names):
 
 
 def method_name(demangled):
-    match = re.search(r"::(~?[A-Za-z_][A-Za-z_0-9]*)\\(", demangled)
+    match = re.search(r"::(~?[A-Za-z_][A-Za-z_0-9]*)\(", demangled)
     return match.group(1) if match else None
 
 
@@ -135,21 +135,21 @@ def main():
     selection = items[:args.max_functions]
     # Write one function at a time, not an in-memory dump of the entire KC.
     with open(args.out, "w", encoding="utf-8") as output:
-        output.write("TARGET: %s\\nMETHODS: %s\\n" %
+        output.write("TARGET: %s\nMETHODS: %s\n" %
                      (args.kc, args.methods))
-        output.write("WARNING: local KC evidence, not validated ABI semantics.\\n")
+        output.write("WARNING: local KC evidence, not validated ABI semantics.\n")
         for i, (_, _, name, mangled, address) in enumerate(selection, 1):
-            output.write("\\n%s\\n%s\\nADDRESS: %#x\\nSYMBOL: %s\\n" %
+            output.write("\n%s\n%s\nADDRESS: %#x\nSYMBOL: %s\n" %
                          ("=" * 75, name, address, mangled))
             try:
                 instructions = dis.function(address) or []
             except (RuntimeError, ValueError, KeyError) as exc:
-                output.write("DISASSEMBLY ERROR: %s\\n" % exc)
+                output.write("DISASSEMBLY ERROR: %s\n" % exc)
                 continue
             for line in instructions[:args.max_lines]:
-                output.write(line + "\\n")
+                output.write(line + "\n")
             if len(instructions) > args.max_lines:
-                output.write("...TRUNCATED %d remaining lines...\\n" %
+                output.write("...TRUNCATED %d remaining lines...\n" %
                              (len(instructions) - args.max_lines))
             print("[%d/%d] %s: %d instruction lines" %
                   (i, len(selection), name, len(instructions)))

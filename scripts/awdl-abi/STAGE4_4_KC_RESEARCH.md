@@ -489,3 +489,61 @@ for tracing the owner-side workloop removal and queue lifetime.
 Never post raw KC disassembly to the public repository.
 
 **No changes to production kext, runtime flags or EFI.**
+
+
+
+## TX callback entry and workloop rescheduling (2026-11-11)
+
+The developer provided the local `awdl-skywalk-tx-entry.txt` output
+containing `IOSkywalkTxSubmissionQueue::initWithPool`,
+`checkForWork` and both `packetSubmission` overloads.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 15.
+
+- `initWithPool` enforces capacity `>= 8`, non-null pool
+  and mandatory packet-submission callback, and flags `<= 0x1f`.
+  The optional budget callback is stored at `queue+0xf0`;
+  the mandatory packet callback and refCon are passed to
+  the base initializer (raw table `__ZTV20IOSkywalkPacketQueue
+  +0x240`, object-vptr `+0x230`).
+- `packetSubmission(bool)` invokes
+  `IOEventSource::tryCloseGate`; if that attempt fails,
+  it increments a work-generation counter and calls
+  `IOEventSource::signalWorkAvailable`, which permits
+  deferred processing.
+- The packetSubmission routes reach `legacyDequeue`
+  and thus the registered `TxSubmissionAction`, or
+  alternate list/refill paths. `checkForWork` checks
+  counters/state and may schedule another submission.
+- This means no proof exists that `disable`,
+  `finalize`, or closing a driver callback admission
+  gate prevents all **future** calls into `refCon`.
+  The workloop detach and owner-side caller sequence
+  are the next research targets.
+
+The collector accepts `IOWorkLoop` and `IOEventSource`
+in `--classes` for focused lifecycle inspection.
+Use the following read-only commands, including `cat`:
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOSkywalkPacketQueue,IOSkywalkTxSubmissionQueue \\
+  --offsets 0x230,0x1d8,0x1e0
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkPacketQueue,IOWorkLoop,IOEventSource \\
+  --methods initWithPool,addEventSource,removeEventSource,signalWorkAvailable \\
+  --max-functions 16 --max-lines 400 \\
+  --out /tmp/awdl-skywalk-workloop-lifetime.txt
+
+cat /tmp/awdl-skywalk-workloop-lifetime.txt
+```
+
+The matched signatures and bodies must be interpreted along with
+their **callers**; merely finding `removeEventSource` does
+not establish that this owner actually uses it or guarantees
+that queue callbacks are quiescent. No live AWDL, queue
+registration, firmware TX/RX or EFI changes should be made.

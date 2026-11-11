@@ -35,6 +35,7 @@ FAMILIES = (
     "IOSkywalkPacketBuffer",
     "IOSkywalkPacketTable",
     "IOSkywalkNetworkInterface",
+    "IOSkywalkInterface",
     "IOSkywalkQueueSet",
     "IOSkywalkLogicalLink",
     "IOWorkLoop",

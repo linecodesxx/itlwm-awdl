@@ -159,8 +159,9 @@ pointer loaded from the raw `__ZTV20IOSkywalkPacketQueue` symbol, not an
 object vptr. The raw table has a 16-byte metadata header. Thus the
 `__ZTV+0x168` indirect call is equivalent to object vptr `+0x158` (slot 43),
 **not** the `getWorkLoop()` at vptr `+0x168` (slot 45). The inspector
-now includes `+0x158` in its default selection. This target remains
-unconfirmed until the next local run.
+now includes `+0x158` in its default selection. That target has since been confirmed locally as
+`IOSkywalkPacketQueue::disable()` (vptr slot 43, address
+`0xffffff8002b0de34`).
 
 The additional disassembler run matched 14 methods and produced nonempty
 bodies for specialized and base `free()` methods, both RX array enqueue
@@ -228,3 +229,23 @@ python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
 The new collector method filter now covers `IOSkywalkPacket` as well as
 the queue and pool classes. The local file should be shared privately,
 not committed as full disassembly.
+
+
+## Finalize virtual and pool-lifetime discovery (developer-reported, 2026-11-11)
+
+The corrected vptr inspection confirmed `IOSkywalkPacketQueue::finalize()` at object-vptr `+0x1c0` (`0xffffff8002b0ddcc`) and specialized `IOSkywalkTxCompletionQueue::finalize()` at the same slot (`0xffffff8002b17d6e`). Therefore, the virtual call preceding storage free in `TxCompletionQueue::free()` targets its specialized `finalize()`. **It is not yet proven to wait for callbacks.**
+
+The read-only packet-lifetime collector matched **7** entries: `deallocatePacket` (27 lines), `deallocatePackets` (51), `completeWithQueue` (53), `disposePacket` (29), `releaseAllPackets` (27), `releaseAllMemorySegments` (19), and a zero-line allocator type view. File `/tmp/awdl-skywalk-packet-lifetime.txt` has not been provided yet, so only symbol presence and successful extraction are confirmed.
+
+The collector now also accepts exact method name `finalize`. Inspect the queue finalize implementations independently:
+
+```sh
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --methods finalize \\
+  --max-functions 10 --max-lines 350 \\
+  --out /tmp/awdl-skywalk-finalize.txt
+```
+
+Do not add extracted proprietary disassembly to public GitHub; share relevant details privately. No production kext sources or runtime gates changed.

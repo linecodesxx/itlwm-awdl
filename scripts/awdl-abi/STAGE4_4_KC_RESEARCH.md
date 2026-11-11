@@ -379,3 +379,59 @@ cat /tmp/awdl-skywalk-callback-lifetime.txt
 If the collector lists fewer than three methods, that is not itself
 a failure: only symbols actually present in this KC will appear.
 Do not commit raw proprietary disassembly, and do not enable AWDL.
+
+
+
+## Vtable, packet cancellation and check-in results (2026-11-11)
+
+The latest local inspection mapped the base queue's `vptr+0x18`
+to `OSObject::getRetainCount()`, TX submission `+0x2a0` to
+`purgePackets()`, packet `+0x1a0` to `complete()`, and packet
+buffer `+0x148` to `completeWithQueue()`. See
+[STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md), section 13.
+
+The next local disassembly (`awdl-skywalk-callback-lifetime.txt`,
+pasted by the developer) showed:
+
+- `IOSkywalkPacket::cancelCompletionCallback()` only stores
+  null in `packet+0x38`.
+- `IOSkywalkPacketBuffer::cancelCompletionCallback()` only
+  stores null in `buffer+0x48`.
+- Neither function is a synchronization barrier for a callback that
+  was previously admitted or captured the old pointer.
+- `IOSkywalkPacketBufferPool::checkInPacketQueue()` creates
+  an `OSSet` if needed, registers the queue under the pool's
+  recursive lock and, if the queue has no interface and insertion
+  succeeded, schedules `_thread_call_enter` **after unlocking**.
+  This proves the presence of a deferred scheduling path, not a
+  no-future-TX-callback guarantee.
+- Base queue `finalize()` both mutates queue field `+0xbc` and
+  separately uses `getRetainCount()`; these are distinct values.
+
+### Next bounded inspection (read-only; show with cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes OSSet --offsets 0x1c0,0x1d8,0x1e0
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --methods purgePackets,complete,completeWithQueue \\
+  --max-functions 12 --max-lines 350 \\
+  --out /tmp/awdl-skywalk-purge-complete.txt
+
+cat /tmp/awdl-skywalk-purge-complete.txt
+```
+
+The new script filter understands exact method names
+`purgePackets` and `complete`. The output may include
+more than one matching overload/class; only the three target
+method bodies are needed for initial review. Do not upload
+proprietary disassembly to a public GitHub repository.
+
+**Current invariant:** Native packet pool return is evidenced,
+but safe refCon lifetime and complete callback quiescence
+are **not proven**. Keep `ITLWM_AWDL_DATAPATH_LIVE=0` and
+AWDL registration disabled. No runtime code changes made.

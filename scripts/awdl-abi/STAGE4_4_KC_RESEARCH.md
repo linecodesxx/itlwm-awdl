@@ -1850,3 +1850,107 @@ enable AWDL.
 
 No kext, EFI, runtime driver or experimental
 AWDL registration/datapath modifications.
+
+
+
+## Full selected-owner scan and typed vptr receiver provenance (2026-11-11)
+
+The developer supplied two static-only 25G332 KC scan
+summaries from `scan_skywalk_direct_calls.py`:
+
+1. All **420/420** symbolic function addresses
+   selected from `IOSkywalkNetworkInterface`,
+   `IOSkywalkInterface`, `IOSkywalkQueueSet`,
+   `IOSkywalkLogicalLink`,
+   `IOSkywalkTxSubmissionQueue`,
+   `IOSkywalkPacketQueue`,
+   `IOSkywalkPacketBufferPool`.
+2. General `IOSkywalk/IOUserNetwork/IOEthernet`
+   ranked slice `[540,720)` out of 2353.
+
+**Selected owner scan:** 0 direct targets,
+30 **untyped** indirect vptr-offset candidates
+at `+0x140,+0x148,+0x1d8`, and no
+disassembly errors/truncations. Prior
+section 21 independently typed one of these:
+`TxSubmissionQueue::enable()` can call
+`packetSubmission(bool)` via `+0x1d8`.
+Other same-offset matches require tracing
+the receiver object before naming a method.
+
+Especially relevant candidates:
+
+- `NetworkInterface::removeSteeringRule`
+  `+0x148` at `0xffffff8002b0f514`.
+- `TxSubmissionQueue::packetSubmission(uint64_t*,uint*,uint*)`
+  `+0x140` at `0xffffff8002b31d12`.
+- `TxSubmissionQueue::getPacketListForKPipe`,
+  `getPacketListForNetworking`,
+  `refillTxRingForKPipe`,
+  `refillTxRingForNetworking` all contain
+  a `+0x140` indirect call; none is yet
+  identified as a WorkLoop receiver.
+
+**General scan [540,720):** 0 direct hits,
+4 untyped offset candidates: `IOSkywalkEthernetInterface::ioctl_lladdr`
+and `IOSkywalkLegacyEthernet::getHardwareAddress`
+at `+0x140`; and two `+0x148`
+indirect calls inside
+`IOSkywalkLegacyEthernetInterface::init`
+at `0xffffff8002b01d46` and
+`0xffffff8002b01f09`.
+
+Combined general coverage is **720/2353
+(30.6%)**, with 0 direct hits. The
+420 selected-owner scan overlaps it:
+**these counts cannot be added** to
+infer total unique scanned functions.
+
+Both logs are only symbolic/offset-level
+evidence. The matching offset does not
+prove the dynamic type is `IOWorkLoop`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md),
+section 33 for exact addresses and caveats.
+
+### Next two targeted read-only collections (both end with cat)
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkNetworkInterface,IOSkywalkTxSubmissionQueue \\
+  --methods removeSteeringRule,requestDequeue,packetSubmission \\
+  --max-functions 6 --max-lines 650 \\
+  --out /tmp/awdl-vptr-owner-provenance.txt
+
+cat /tmp/awdl-vptr-owner-provenance.txt
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOSkywalkLegacyEthernetInterface \\
+  --methods init \\
+  --max-functions 2 --max-lines 650 \\
+  --out /tmp/awdl-vptr-legacy-init.txt
+
+cat /tmp/awdl-vptr-legacy-init.txt
+```
+
+The first traces `+0x148` in the interface
+steering-rule method and `+0x140` /
+`+0x1d8` inside TX submission and dequeue.
+The second traces **both** `+0x148`
+sites within legacy interface initialization.
+
+**Interpretation gate:** only claim
+`IOWorkLoop::removeEventSource` if
+register/dataflow provenance proves the
+receiver is an `IOWorkLoop` (or
+known compatible subclass) at the
+actual call site. A direct same-offset
+match is insufficient.
+
+The read-only collector has been updated
+to include `IOSkywalkLegacyEthernetInterface`.
+No driver, EFI, runtime flags or
+proprietary KC data was modified or
+committed.

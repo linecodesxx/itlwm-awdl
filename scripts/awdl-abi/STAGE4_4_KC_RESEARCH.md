@@ -179,3 +179,52 @@ python3 scripts/awdl-abi/inspect_skywalk_vtables.py \
 ```
 
 See `STAGE4_4_KC_ANALYSIS.md` for details. No runtime gates changed.
+
+
+## Second disassembly control-flow review (developer-uploaded file, 2026-11-11)
+
+The actual `awdl-skywalk-remaining-evidence.txt` was reviewed.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md) section 9.
+
+**Established from the code:**
+
+- `TxSubmissionQueue::free` tears down its packet table and metadata; its
+  displayed specialized body does **not** explicitly drain callbacks.
+- `TxCompletionQueue::free` calls `this->vptr+0x1c0` **before** freeing
+  storage and lock. This remains a priority unknown. Field `+0xac` is
+  used as a pointer-array storage length; its meaning at initialization
+  still needs checking.
+- `RxCompletionQueue::free` destroys packet table and support objects;
+  base queue free releases its pool reference.
+- Pool free cancels **its own** deferred thread call with
+  `_thread_call_cancel_wait`, then releases all packets and memory segments.
+  This does not establish no-future-entry into the TX submission callback.
+- RX Networking builds native `kern_packet_t` chains and sends them to
+  `_kern_netif_queue_rx_enqueue`; the wrapper is disposed beforehand.
+  This may be legitimate distinct ownership, but must be verified.
+- RX KPipe operates on packet-table state and calls
+  `RxCompletionQueue::sendNotification`, without the Networking enqueue.
+- `resetABFS` resets adaptive queue fields, **not** callback lifetime.
+
+These observations are relevant to eventual ownership accounting, but
+they do not justify enabling runtime queues.
+
+### Targeted next commands (read-only)
+
+```sh
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOSkywalkPacketQueue,IOSkywalkTxCompletionQueue \\
+  --offsets 0x90,0x158,0x1c0
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --methods deallocatePacket,deallocatePackets,completeWithQueue,disposePacket,releaseAllPackets,releaseAllMemorySegments \\
+  --max-functions 15 --max-lines 350 \\
+  --out /tmp/awdl-skywalk-packet-lifetime.txt
+```
+
+The new collector method filter now covers `IOSkywalkPacket` as well as
+the queue and pool classes. The local file should be shared privately,
+not committed as full disassembly.

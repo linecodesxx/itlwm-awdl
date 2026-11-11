@@ -139,3 +139,43 @@ These scripts are read-only. The vtable mapping will help identify the
 batch/single packet return operations. Share results privately for review;
 do not commit proprietary disassembly to GitHub. Kernel behavior remains
 unproven and all AWDL runtime gates stay off.
+
+## Second local method discovery and virtual mapping (2026-11-11)
+
+The developer ran the local vtable inspector and a second read-only disassembly
+collection. The vtable map verified:
+
+- `IOSkywalkPacket::getDataLength()` at vptr `+0x140`,
+  `completeWithQueue()` at `+0x198`, and `disposePacket()` at `+0x1e0`.
+- `IOSkywalkPacketBufferPool::deallocatePacket()` at vptr `+0x140`
+  and `deallocatePackets()` at `+0x148`.
+- Consequently, the already-reviewed TX completion array code calls
+  `deallocatePackets()` after individual `completeWithQueue()` operations;
+  the linked-list TX overload calls `deallocatePacket()` per packet.
+  The actual return-to-pool failure semantics must still be verified.
+
+**Important vtable correction:** `disable()` wrappers call through a table
+pointer loaded from the raw `__ZTV20IOSkywalkPacketQueue` symbol, not an
+object vptr. The raw table has a 16-byte metadata header. Thus the
+`__ZTV+0x168` indirect call is equivalent to object vptr `+0x158` (slot 43),
+**not** the `getWorkLoop()` at vptr `+0x168` (slot 45). The inspector
+now includes `+0x158` in its default selection. This target remains
+unconfirmed until the next local run.
+
+The additional disassembler run matched 14 methods and produced nonempty
+bodies for specialized and base `free()` methods, both RX array enqueue
+paths, and `resetABFS()`. Its content was saved at
+`/tmp/awdl-skywalk-remaining-evidence.txt` on the developer's Mac.
+**Only its symbol/count output has been provided**; the underlying second
+disassembly has not yet been reviewed, so no lifetime or error-path claim
+is justified from it.
+
+Next: review that second file and run:
+
+```sh
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \
+  --classes IOSkywalkPacketQueue,IOSkywalkTxSubmissionQueue,IOSkywalkTxCompletionQueue,IOSkywalkRxCompletionQueue \
+  --offsets 0x158
+```
+
+See `STAGE4_4_KC_ANALYSIS.md` for details. No runtime gates changed.

@@ -547,3 +547,65 @@ their **callers**; merely finding `removeEventSource` does
 not establish that this owner actually uses it or guarantees
 that queue callbacks are quiescent. No live AWDL, queue
 registration, firmware TX/RX or EFI changes should be made.
+
+
+
+## WorkLoop detach and base queue refCon investigation (2026-11-11)
+
+The developer provided local KC vtable and disassembly results in
+`awdl-skywalk-workloop-lifetime.txt` for
+`IOSkywalkPacketQueue::initWithPool`,
+`IOWorkLoop::{addEventSource,removeEventSource,signalWorkAvailable}`,
+and `IOEventSource::signalWorkAvailable`.
+See [STAGE4_4_KC_ANALYSIS.md](STAGE4_4_KC_ANALYSIS.md), section 16.
+
+- The base queue initializer stores the provided **refCon** in
+  `queue+0x58` with no demonstrated lifetime retention. The mandatory
+  callback is supplied to the superclass init. `queue+0xac` is
+  confirmed as the passed table capacity, used later for TX ring
+  and completion array sizing.
+- `IOWorkLoop::addEventSource` dispatches through the object
+  at `workloop+0x20` and its virtual slot `+0x1c0` using
+  operation argument 0.
+- `IOWorkLoop::removeEventSource` dispatches through that
+  same slot with operation argument 1. The body does **not**
+  show the actual removal algorithm or callback-drain barrier.
+- `IOEventSource::signalWorkAvailable` forwards to its
+  workloop, which marks pending work and wakes its thread
+  through `_thread_wakeup_thread`.
+- **No proof** has yet been found that a removed event source
+  cannot run `legacyDequeue` again, including direct
+  submission callers and previously queued work. The callback's
+  embedded `SkywalkBackend::txCallbackContext_` must remain alive
+  until a separately evidenced no-future-entry barrier exists.
+
+### Next: map the internal workloop operation and caller teardown
+
+The read-only collector now accepts `IOCommandGate` and
+selected gate/workloop methods. Inspect the workloop's internal
+dispatch virtual, then extract focused methods:
+
+```bash
+cd ~/Desktop/itlwm
+git pull --ff-only awdl research/awdl-stage4-4-skywalk-kc
+
+python3 scripts/awdl-abi/inspect_skywalk_vtables.py \\
+  --classes IOCommandGate,IOWorkLoop,IOEventSource \\
+  --offsets 0x170,0x1c0
+
+python3 scripts/awdl-abi/collect_skywalk_queue_evidence.py \\
+  --classes IOCommandGate,IOWorkLoop,IOEventSource \\
+  --methods runAction,runCommand,setWorkLoop,removeEventSource \\
+  --max-functions 12 --max-lines 400 \\
+  --out /tmp/awdl-workloop-dispatch.txt
+
+cat /tmp/awdl-workloop-dispatch.txt
+```
+
+It is possible that the workloop's private `+0x20` object is
+**not** an ordinary `IOCommandGate`; in that case, names for the
+`+0x1c0` operation may require identifying a private subclass.
+Do not equate a vtable match on the wrong class with its runtime
+target, and do not publish raw KC disassembly.
+
+No kernel C++ sources, kext runtime flags or EFI are modified.

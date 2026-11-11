@@ -366,3 +366,85 @@ The full `awdl-skywalk-packet-lifetime.txt` and `awdl-skywalk-finalize.txt` were
 - `RxCompletionQueue::finalize` invokes `IOSkywalkPacketTable::flushAllPackets` after base success; internals remain to be examined.
 
 No live TX/RX, AWDL interface registration, or callback lifetime change is authorized.
+
+
+
+## 12. Packet-table flush and pool queue checkout (2026-11-11)
+
+**Source:** developer-provided console disassembly from local Tahoe
+`BootKernelExtensions.kc`, for three precisely named methods.
+Only interpretation and key call names are recorded, not raw code.
+
+### 12.1 `IOSkywalkPacketBufferPool::checkOutPacketQueue`
+
+Address `0xffffff8002b0ab92`:
+
+- Acquires `IORecursiveLockLock(pool+0x80)`.
+- If `pool+0x90` is not null, invokes a virtual method at offset
+  `+0x1d8` on that object, passing the candidate queue.
+- Creates an `OSCollectionIterator` over `pool+0xa0`; examines
+  contained objects (including a field at `object+0x88` compared against
+  the pool), conditionally calls a virtual removal method `+0x1d8`
+  on the collection, and completes iteration.
+- Releases `pool+0x80` lock on exit.
+
+This is evidence of **pool-side queue registration/collection bookkeeping**
+under a lock. It does **not** demonstrate that the queue's workloop
+was detached or that external callers have stopped invoking the queue
+callback. The identity of the objects at `pool+0x90` and `pool+0xa0`
+requires inspection before calling this a full unregister barrier.
+
+### 12.2 `IOSkywalkPacketTable::flushAllPackets`
+
+Address `0xffffff8002b0e7bc`:
+
+1. Computes remaining packet count in the ring/table using fields at
+   `table+0`, `table+4` and the current read index at `table+0x80`.
+2. For every remaining `IOSkywalkPacket*`, invokes
+   `IOSkywalkPacket::cancelCompletionCallback()` (at
+   `0xffffff8002b0b8d4`).
+3. Passes the same contiguous ring segment and count to pool virtual
+   offset `+0x148`, previously resolved as
+   `IOSkywalkPacketBufferPool::deallocatePackets()`. That method
+   mutates the segment from wrapper pointers to native packet handles
+   before calling native `_kern_pbufpool_free_batch`.
+4. Advances the table read index, including wraparound, and repeats
+   until no pending entries remain.
+
+**This is a real cleanup path for queued RX packets**, confirmed by
+the earlier `RxCompletionQueue::finalize()` call to `flushAllPackets`
+on base-finalize success. The local body offers no separate per-packet
+error/status handling for pool batch deallocation. Its cancellation
+refers to a **per-packet completion callback**, not necessarily the
+TX submission queue's function pointer/refCon.
+
+**Important:** because the packet-pointer table segment is mutated
+in place by `deallocatePackets`, the ring must not be read again as
+`IOSkywalkPacket*` until its entries are populated afresh.
+
+### 12.3 `IOSkywalkPacketBuffer::disposePacketBuffer`
+
+Address `0xffffff8002b0be8c`: stores zero in packet-buffer fields
+`+0x30`, `+0x38`, `+0x40`, `+0x48`, and `+0x78`.
+No native packet pool-free, dynamic free or callback wait appears
+in this 13-instruction body. It is a **wrapper metadata reset**,
+not proof that native packet buffers have been freed.
+
+### 12.4 Open questions
+
+- The body of `IOSkywalkPacket::cancelCompletionCallback()` remains
+  unreviewed. Investigate where the completion callback is stored
+  and whether cancel prevents later delivery, without conflating
+  it with the TX submission queue's `TxSubmissionAction`.
+- Base queue finalize invokes `checkOutPacketQueue`, but pool
+  collection checkout is not a proven workloop callback-quiescence
+  barrier.
+- The earlier request for the vptr mapping of base queue `+0x18`,
+  packet `+0x1a0`, packet buffer `+0x148`, and TX submission
+  queue `+0x2a0` still needs a local result.
+- No evidence yet proves safe `SkywalkBackend` or
+  `TxCallbackContext` destruction after `disable()/release()`.
+
+**Safety conclusion:** keep all Stage 4.2/4.3 runtime gates disabled;
+do not infer that canceling RX packet completion callbacks also
+quiesces the TX submission callback.
